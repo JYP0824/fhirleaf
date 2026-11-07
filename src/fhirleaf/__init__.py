@@ -9,7 +9,7 @@ JVM or database service is needed; `server.serve` is an optional HTTP adapter.
 from .search import Engine, SearchError
 from .store import load
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 def connect(path, base_url="http://localhost/fhir", default_count=None, max_count=None):

@@ -15,7 +15,7 @@ MODIFIERS = {
     "string": ["missing", "exact", "contains"],
     "reference": ["missing", "Type", "identifier", "below", "above"],
     "date": ["missing"], "number": ["missing"], "quantity": ["missing"],
-    "uri": ["missing", "below", "above"], "composite": ["missing"], "special": ["missing"],
+    "uri": ["missing", "below", "above"], "composite": [], "special": ["missing"],
 }
 PREFIXES = ["eq", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"]
 RESOLVE_NAVIGATION = re.compile(r"resolve\(\)\s*(\.|\)\s*\.|as\b)")

@@ -22,21 +22,60 @@ from .search import Engine
 PREFIX = "/fhir"
 MAX_BODY = 1 << 20
 ASCII_LENGTH = re.compile(r"[0-9]{1,18}")
-JSON_TYPES = ("application/fhir+json", "application/json", "application/*", "*/*", "json")
+# response type for each acceptable media range (generic types are echoed back, R4 Content Types)
+JSON_TYPES = {"application/fhir+json": "application/fhir+json", "application/json": "application/json",
+              "text/json": "text/json", "application/json+fhir": "application/json+fhir",
+              "application/*": "application/fhir+json", "*/*": "application/fhir+json", "json": "application/fhir+json"}
+FORMAT_TYPES = {"json": "application/fhir+json", "application/fhir+json": "application/fhir+json",
+                "application/json": "application/json", "text/json": "text/json",
+                "application/json+fhir": "application/json+fhir"}
 
 
 def _outcome(code, diagnostics):
     return {"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": code, "diagnostics": diagnostics}]}
 
 
-def accepts_json(accept):
+def negotiate(accept):
+    """Content type for an Accept header (server-driven negotiation with q-values and the
+    fhirVersion parameter), or None when no JSON type is acceptable."""
     if not accept or not accept.strip():
-        return True
-    return any(t.split(";")[0].strip().lower() in JSON_TYPES for t in accept.split(","))
+        return "application/fhir+json"
+    best = None
+    for item in accept.split(","):
+        fields = [f.strip() for f in item.split(";")]
+        media, params = fields[0].lower(), {}
+        for f in fields[1:]:
+            k, _, v = f.partition("=")
+            params[k.strip().lower()] = v.strip().strip('"')
+        if media not in JSON_TYPES:
+            continue
+        try:
+            q = float(params.get("q", "1"))
+        except ValueError:
+            q = 0.0
+        version = params.get("fhirversion")
+        if q <= 0 or (version and not version.startswith("4.0")):
+            continue
+        if best is None or q > best[0]:
+            best = (q, JSON_TYPES[media])
+    return best[1] if best else None
+
+
+def preference(header, name):
+    """Value of one RFC 7240 preference (names case-insensitive, values may be quoted)."""
+    for item in (header or "").split(","):
+        key, _, value = item.strip().partition("=")
+        if key.strip().lower() == name:
+            return value.strip().strip('"').lower()
+    return None
+
+
+def allowed_methods(path):
+    return "POST" if path.split("?", 1)[0].rstrip("/").endswith("/_search") else "GET, HEAD"
 
 
 def serve(db_path, host="127.0.0.1", port=0, public_base=None, default_handling="strict",
-          default_count=None, max_count=None):
+          default_count=None, max_count=None, cors_origin=None):
     """Returns (server, base_url). public_base: the base URL clients see (behind a proxy);
     default http://host:port/fhir. default_handling: unknown-parameter handling when a request
     sends no Prefer header (strict = 400, lenient = ignore and report)."""
@@ -64,9 +103,20 @@ def serve(db_path, host="127.0.0.1", port=0, public_base=None, default_handling=
         def _not_allowed(self):
             self._send(405, _outcome("not-supported", f"{self.command} is not supported: this endpoint is read-only "
                                                        "FHIR RESTful Search (GET, HEAD, POST .../_search)"),
-                       extra={"Allow": "GET, HEAD, POST"})
+                       extra={"Allow": allowed_methods(self.path)})
 
-        do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _not_allowed
+        do_PUT = do_DELETE = do_PATCH = _not_allowed
+
+        def do_OPTIONS(self):
+            if cors_origin and self.headers.get("Origin"):        # CORS preflight (opt-in)
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", cors_origin)
+                self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST")
+                self.send_header("Access-Control-Allow-Headers", "Accept, Content-Type, Prefer")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._not_allowed()
 
         def do_POST(self):
             # A request whose body length is unusable is answered and the connection closed:
@@ -99,17 +149,24 @@ def serve(db_path, host="127.0.0.1", port=0, public_base=None, default_handling=
             if not (self.path == PREFIX or self.path.startswith((PREFIX + "/", PREFIX + "?"))):
                 self._send(404, _outcome("not-found", f"Unknown path {self.path}; the FHIR base is {url}"), head=head)
                 return
-            if not accepts_json(self.headers.get("Accept")):
-                self._send(406, _outcome("not-supported", "Only JSON (application/fhir+json) is supported"), head=head)
+            content_type = negotiate(self.headers.get("Accept"))
+            if content_type is None:
+                self._send(406, _outcome("not-supported", "Only JSON (application/fhir+json, FHIR 4.0) is supported"),
+                           head=head)
                 return
+            fmt = re.search(r"[?&]_format=([^&]*)", self.path)
+            if fmt:
+                from urllib.parse import unquote_plus
+                content_type = FORMAT_TYPES.get(unquote_plus(fmt.group(1)).split(";")[0].strip().lower().replace(" ", "+"),
+                                                content_type)
+            self.content_type = content_type
             try:
                 engine = pool.get_nowait()
             except queue.Empty:
                 engine = Engine(db_path, base_url=url, cache=cache, default_count=default_count, max_count=max_count)
             try:
-                prefer = (self.headers.get("Prefer") or "").replace(" ", "")
-                handling = ("lenient" if "handling=lenient" in prefer else "strict" if "handling=strict" in prefer
-                            else default_handling)
+                prefer = preference(self.headers.get("Prefer"), "handling")
+                handling = prefer if prefer in ("strict", "lenient") else default_handling
                 path = self.path[len(PREFIX):] or "/"
                 if body is None:
                     status, result = engine.get(path, handling)
@@ -120,8 +177,12 @@ def serve(db_path, host="127.0.0.1", port=0, public_base=None, default_handling=
             finally:
                 pool.put(engine)
             body = result
-            extra = {"Allow": "GET, HEAD, POST"} if status == 405 else {}
+            extra = {"Allow": allowed_methods(self.path)} if status == 405 else {}
             meta = body.get("meta") or {}
+            if status == 200 and body.get("resourceType") == "CapabilityStatement":
+                import hashlib
+                tag = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
+                extra["ETag"] = f'W/"{tag}"'
             if status == 200 and body.get("resourceType") not in ("Bundle", "OperationOutcome", "CapabilityStatement"):
                 if meta.get("versionId"):
                     extra["ETag"] = f'W/"{meta["versionId"]}"'
@@ -135,7 +196,9 @@ def serve(db_path, host="127.0.0.1", port=0, public_base=None, default_handling=
         def _send(self, status, body, head=False, extra=None):
             data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/fhir+json;charset=utf-8")
+            self.send_header("Content-Type", f"{getattr(self, 'content_type', 'application/fhir+json')};charset=utf-8")
+            if cors_origin and self.headers.get("Origin"):
+                self.send_header("Access-Control-Allow-Origin", cors_origin)
             self.send_header("Content-Length", str(len(data)))
             for key, value in (extra or {}).items():
                 self.send_header(key, value)

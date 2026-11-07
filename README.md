@@ -12,7 +12,7 @@ It loads FHIR data into one SQLite file and searches it on your machine, with no
 ## Quick start
 
 ```bash
-uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.1"
+uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.2"
 curl -fL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
 fhirleaf verify --cases --definitions definitions-r4.json.zip
 fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store.db
@@ -24,11 +24,11 @@ fhirleaf serve --db store.db --port 8080
 
 | Source | Command |
 |---|---|
-| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.1"` |
+| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.2"` |
 | PyPI (after release) | `uv add fhirleaf` |
-| Wheel | `uv add ./fhirleaf-0.1.1-py3-none-any.whl` |
+| Wheel | `uv add ./fhirleaf-0.1.2-py3-none-any.whl` |
 | Local checkout | `uv add --editable ./fhirleaf` |
-| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.1"` |
+| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.2"` |
 
 `pip install` takes the same sources.
 
@@ -91,12 +91,14 @@ status, bundle = store.post("Observation/_search", b"patient=Patient/1")
 | `lenient` | Ignored and reported in an `outcome` entry | `Prefer: handling=lenient`, `serve --handling lenient`, `get --lenient`, `handling="lenient"` |
 
 FHIR leaves this default to the server. State the mode when comparing results.
+Read and vread accept only `_summary`, `_elements`, `_format` and `_pretty`.
+Empty parameters are ignored in both modes.
 
 ## Check
 
 | Command | What it checks | Result |
 |---|---|---|
-| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP | 243/243 cases, 139/139 combinations |
+| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP | 302/302 cases, 157/157 combinations |
 | `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching | MIMIC-IV-on-FHIR Demo 1,240/1,240, Synthea + US Core 2,431/2,431 |
 | `fhirleaf support --definitions D --output FILE` | Status of every SearchParameter per resource type | R4: 2,873 of 3,026 supported |
 
@@ -116,13 +118,20 @@ fhirleaf compare --db store.db --recorded recorded.jsonl --report report.json
 |---|---|
 | `GET [base]/metadata` | CapabilityStatement |
 | `GET [base]/[type]?params` | Type search |
-| `GET [base]/[compartment]/[id]/[type]?params` | Compartment search |
-| `GET [base]?_type=A,B&params` | Whole-system search |
-| `GET [base]/[type]/[id]` | Read |
+| `GET [base]/[compartment]/[id]/[type]?params` | Compartment search (`*` for every type) |
+| `GET [base]?_type=A,B&params` | Whole-system search (repeated `_type` is AND) |
+| `GET [base]/[type]/[id]` | Read (with `_summary` or `_elements`) |
 | `GET [base]/[type]/[id]/_history/1` | Vread (one stored version) |
-| `POST [base]/[type]/_search` | Search with a form-encoded body |
+| `POST [base]/_search`, `[type]/_search`, `[compartment]/[id]/[type]/_search` | Search with a form-encoded body |
 | `HEAD` | Headers only |
-| Other methods | `405` |
+| Other methods | `405` with `Allow: GET, HEAD` |
+| History, operations (`$...`) | `400` |
+
+Responses use the requested JSON type: `application/fhir+json` (default), `application/json`,
+`text/json` or `application/json+fhir`, chosen by `_format` or by `Accept` with q-values.
+An `Accept` that excludes JSON or asks for another `fhirVersion` gets `406`.
+Reads and `metadata` carry an `ETag`. Conditional reads are not supported, so reads always
+return the full resource.
 
 ### Parameters
 
@@ -130,20 +139,32 @@ fhirleaf compare --db store.db --recorded recorded.jsonl --report report.json
 |---|---|---|
 | token | `:missing` `:not` `:text` `:in` `:not-in` `:of-type` | – |
 | reference | `:missing` `:[type]` `:identifier` `:below` `:above`, chains, `_has` | – |
-| date | `:missing` | `eq ne gt lt ge le sa eb ap` |
+| date (incl. Period and Timing) | `:missing` | `eq ne gt lt ge le sa eb ap` |
 | string | `:missing` `:exact` `:contains`, phonetic (Soundex) | – |
-| quantity | `:missing` | `eq ne gt lt ge le sa eb ap` |
+| quantity (incl. Money, Range) | `:missing` | `eq ne gt lt ge le sa eb ap` |
 | number | `:missing` | `eq ne gt lt ge le sa eb ap` |
-| uri | `:missing` `:below` `:above` | – |
-| composite | `:missing` (token + one component) | of the second component |
+| uri | `:missing`, `:below` `:above` (URLs only), canonical `url\|version` | – |
+| composite | none (token + one component) | of the second component |
 | special | `near` | – |
 
 Common parameters: `_id`, `_lastUpdated`, `_list`, `_content`, `_text` (with `--fulltext`).
+
+| Rule | Behaviour |
+|---|---|
+| Token codes and identifier values | Case-insensitive (ASCII). Systems are exact. |
+| Strings | Case, accents, punctuation and repeated whitespace are ignored. Family-name parts match on their own. |
+| Timing | Matched by its outer limits (events and `repeat.boundsPeriod`). |
+| Plain id on a reference with several target types | `400` when the id exists in more than one of them. Use `Type/id`. |
+| Unknown `_list` | Empty result |
+| `_text`, `_content` | Words (all required), `"phrases"`, `AND`, `OR`, `NOT`, parentheses. Commas are OR. |
 
 ### Result parameters
 
 `_count`, `_sort`, `_total`, `_summary`, `_elements`, `_include`, `_revinclude`
 (`Type:*`, `*`, `:iterate`), `_contained`, `_containedType`, `_format`, `_pretty`.
+
+`_summary` with `_elements`, and `_include` or `_revinclude` with `_summary=text`, return `400`.
+The `self` link carries the parameters actually used, and on later pages it is that page.
 
 ### Server choices
 
@@ -155,6 +176,8 @@ Common parameters: `_id`, `_lastUpdated`, `_list`, `_content`, `_text` (with `--
 | Missing sort values | Last |
 | `near` without a distance | 1 km |
 | Phonetic matching | American Soundex |
+| `ap` reference point | Load instant (`--last-updated`), not the current time |
+| Sort on token, reference | By code, by target id |
 
 These choices are stored in the file and reported in `metadata`.
 
@@ -189,6 +212,7 @@ uv publish
 
 `serve` has no authentication, authorisation, TLS or rate limiting.
 It binds to `127.0.0.1` by default. Expose it only behind a proxy that adds these.
+CORS is off by default. `serve --cors-origin ORIGIN` enables it for one origin.
 
 ## License
 

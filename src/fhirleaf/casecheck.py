@@ -56,6 +56,9 @@ def _bundle_pages(fetch, first):
         status, page = fetch(nxt[0])
         if status != 200:
             return status, None, None, body
+        # a later page's self link is that page (R4 paging)
+        own = [link["url"] for link in page.get("link", []) if link.get("relation") == "self"]
+        body.setdefault("__page_self", []).append(own == [nxt[0]])
     return 200, matches, includes, body
 
 
@@ -103,6 +106,23 @@ def _judge(expect, status, matches, includes, body, headers=None, raw_body=b""):
         problems.append("HEAD returned a body")
     if "header" in expect and not (headers or {}).get(expect["header"]):
         problems.append(f"missing header {expect['header']}")
+    lowered = {k.lower(): v for k, v in (headers or {}).items()}
+    for name, value in expect.get("header_equals", {}).items():
+        if lowered.get(name.lower()) != value:
+            problems.append(f"header {name}: {lowered.get(name.lower())!r} expected {value!r}")
+    if "self" in expect:
+        own = [l["url"] for l in body.get("link", []) if l.get("relation") == "self"]
+        got = own[0].split("/fhir", 1)[1] if own and "/fhir" in own[0] else own
+        if got != expect["self"]:
+            problems.append(f"self link {got!r} expected {expect['self']!r}")
+    if expect.get("page_self") and (not body.get("__page_self") or not all(body["__page_self"])):
+        problems.append(f"later page self links: {body.get('__page_self')}")
+    if "read_subsetted" in expect:
+        tagged = any(t.get("code") == "SUBSETTED" for t in (body.get("meta") or {}).get("tag", []))
+        if tagged != expect["read_subsetted"]:
+            problems.append(f"read SUBSETTED {tagged} expected {expect['read_subsetted']}")
+    if "read_keys" in expect and sorted(body) != sorted(expect["read_keys"]):
+        problems.append(f"read elements {sorted(body)} expected {sorted(expect['read_keys'])}")
     return problems
 
 

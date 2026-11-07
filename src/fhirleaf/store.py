@@ -26,7 +26,7 @@ from .fhirpath import Model
 from .inputs import conditional_key, conditional_references, input_files, package_resources, read_file, resolve_conditional
 from .values import resolve_timezone
 
-VERSION = "fhirleaf-store-v1"
+VERSION = "fhirleaf-store-v2"
 SCHEMA = """
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE strings(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);
@@ -37,13 +37,14 @@ CREATE TABLE params(id INTEGER PRIMARY KEY, type TEXT NOT NULL, code TEXT NOT NU
                     usage TEXT, multiple_or INTEGER, multiple_and INTEGER, UNIQUE(type, code));
 -- contained resources are rows too: id 'Container/cid#local', container = the container's pid
 CREATE TABLE resources(pid INTEGER PRIMARY KEY, type_id INTEGER NOT NULL, id TEXT NOT NULL, json BLOB NOT NULL, container INTEGER);
-CREATE TABLE sp_token(param INTEGER NOT NULL, system INTEGER, code TEXT NOT NULL, pid INTEGER NOT NULL);
+-- token codes and identifier values compare case-insensitively (ASCII; R4: 'when in doubt' case-insensitive)
+CREATE TABLE sp_token(param INTEGER NOT NULL, system INTEGER, code TEXT NOT NULL COLLATE NOCASE, pid INTEGER NOT NULL);
 -- Identifier.type coding + value, for token :of-type
-CREATE TABLE sp_ident_type(param INTEGER NOT NULL, tsystem INTEGER, tcode TEXT NOT NULL, value TEXT NOT NULL, pid INTEGER NOT NULL);
+CREATE TABLE sp_ident_type(param INTEGER NOT NULL, tsystem INTEGER, tcode TEXT NOT NULL COLLATE NOCASE, value TEXT NOT NULL COLLATE NOCASE, pid INTEGER NOT NULL);
 CREATE TABLE sp_token_text(param INTEGER NOT NULL, norm TEXT NOT NULL, pid INTEGER NOT NULL);
 CREATE TABLE sp_ref(param INTEGER NOT NULL, target_type INTEGER NOT NULL, target_id TEXT NOT NULL, pid INTEGER NOT NULL);
 CREATE TABLE sp_ref_url(param INTEGER NOT NULL, url TEXT NOT NULL, version TEXT, pid INTEGER NOT NULL);
-CREATE TABLE sp_ref_ident(param INTEGER NOT NULL, system INTEGER, value TEXT NOT NULL, pid INTEGER NOT NULL);
+CREATE TABLE sp_ref_ident(param INTEGER NOT NULL, system INTEGER, value TEXT NOT NULL COLLATE NOCASE, pid INTEGER NOT NULL);
 -- date ranges in microseconds since 1970-01-01T00:00:00Z
 CREATE TABLE sp_date(param INTEGER NOT NULL, low INTEGER NOT NULL, high INTEGER NOT NULL, pid INTEGER NOT NULL);
 CREATE TABLE sp_string(param INTEGER NOT NULL, norm TEXT NOT NULL, exact TEXT NOT NULL, pid INTEGER NOT NULL);
@@ -55,10 +56,10 @@ CREATE TABLE sp_uri(param INTEGER NOT NULL, uri TEXT NOT NULL, pid INTEGER NOT N
 CREATE TABLE sp_position(param INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, pid INTEGER NOT NULL);
 -- second component: token (c2_system, c2_code), quantity (interval c2_low/c2_high, c2_system, c2_code, unit in c2_text),
 -- date (c2_low, c2_high) or string (normalized c2_text)
-CREATE TABLE sp_composite(param INTEGER NOT NULL, system INTEGER, code TEXT NOT NULL, c2_system INTEGER, c2_code TEXT,
+CREATE TABLE sp_composite(param INTEGER NOT NULL, system INTEGER, code TEXT NOT NULL COLLATE NOCASE, c2_system INTEGER, c2_code TEXT COLLATE NOCASE,
                           c2_value REAL, c2_low INTEGER, c2_high INTEGER, c2_text TEXT, pid INTEGER NOT NULL);
 CREATE TABLE valuesets(url TEXT PRIMARY KEY, complete INTEGER NOT NULL);
-CREATE TABLE valueset_codes(url TEXT NOT NULL, system INTEGER, code TEXT NOT NULL);
+CREATE TABLE valueset_codes(url TEXT NOT NULL, system INTEGER, code TEXT NOT NULL COLLATE NOCASE);
 """
 INDEXES = """
 CREATE INDEX resources_type_id ON resources(type_id, id);
@@ -309,7 +310,9 @@ def capability(params, supported, settings, definitions, compartments):
     note = (f"fhirleaf embedded FHIR RESTful Search. Date/time search values without an offset are read in zone "
             f"{settings['timezone']}; default page size {settings['default_count']}, maximum {settings['max_count']}; "
             f"results without _sort are in stable store order; near without a distance uses "
-            f"{settings['near_default_km']} km; phonetic parameters match by American Soundex of a name word.")
+            f"{settings['near_default_km']} km; phonetic parameters match by American Soundex of a name word; "
+            f"token codes and identifier values compare case-insensitively (ASCII); date 'ap' is 10% of the distance "
+            f"from the load instant {settings['last_updated']}.")
     return {"resourceType": "CapabilityStatement", "status": "active", "kind": "instance",
             "fhirVersion": definitions.fhir_version, "date": settings["last_updated"],
             "format": ["application/fhir+json"], "software": {"name": "fhirleaf", "version": VERSION},

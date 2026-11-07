@@ -11,7 +11,7 @@ import zlib
 from datetime import datetime, timezone
 from itertools import count
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from .store import VERSION as STORE_VERSION
 from .values import (date_range, normalize, number_bounds, resolve_timezone, soundex, split_escaped, split_or, split_prefix,
@@ -45,7 +45,9 @@ def operation_outcome(error):
 CONTROL_VALUES = {"_summary": {"true", "false", "text", "data", "count"}, "_total": {"none", "estimate", "accurate"},
                   "_contained": {"false", "true", "both"}, "_containedType": {"container", "contained"},
                   "_pretty": {"true", "false"}}
-JSON_FORMATS = {"json", "application/json", "application/fhir+json"}
+JSON_FORMATS = {"json", "application/json", "application/fhir+json", "application/json+fhir", "text/json"}
+SINGLE_CONTROLS = ("_count", "_summary", "_total", "_contained", "_containedType", "_format", "_pretty")
+READ_PARAMETERS = {"_format", "_pretty", "_summary", "_elements"}
 CHOICE_TYPES = {"Address", "Age", "Annotation", "Attachment", "Base64Binary", "Boolean", "Canonical", "Code",
                 "CodeableConcept", "Coding", "ContactDetail", "ContactPoint", "Contributor", "Count", "DataRequirement",
                 "Date", "DateTime", "Decimal", "Distance", "Dosage", "Duration", "Expression", "HumanName", "Id",
@@ -86,6 +88,111 @@ class Crit:
 
     def on(self, alias):
         return self.cond.replace("{a}", alias), self.args
+
+
+TEXT_TOKEN = re.compile(r'\s*(?:(\()|(\))|"([^"]*)"|([^\s()"]+))')
+
+
+def parse_text_query(text):
+    """_text/_content syntax: words (implicit AND), "quoted phrases", AND, OR, NOT (any case) and
+    parentheses. Returns a tree: ("word", [terms]) | ("and"|"or", [a, b]) | ("not", [a]), or None."""
+    tokens, pos = [], 0
+    while pos < len(text):
+        m = TEXT_TOKEN.match(text, pos)
+        if not m or m.end() == pos:
+            if text[pos:].strip():
+                raise ValueError("unbalanced quote")
+            break
+        pos = m.end()
+        if m.group(1):
+            tokens.append(("(", None))
+        elif m.group(2):
+            tokens.append((")", None))
+        elif m.group(3) is not None:
+            words = re.findall(r"[^\W_]+", m.group(3))
+            if words:
+                tokens.append(("word", words))
+        else:
+            word = m.group(4)
+            if word.upper() in ("AND", "OR", "NOT"):
+                tokens.append((word.upper(), None))
+            else:
+                words = re.findall(r"[^\W_]+", word)
+                if words:
+                    tokens.append(("word", words))
+    i = 0
+
+    def expr():
+        nonlocal i
+        left = term()
+        while i < len(tokens) and tokens[i][0] == "OR":
+            i += 1
+            left = ("or", [left, term()])
+        return left
+
+    def term():
+        nonlocal i
+        left = factor()
+        while i < len(tokens) and tokens[i][0] not in ("OR", ")"):
+            if tokens[i][0] == "AND":
+                i += 1
+            left = ("and", [left, factor()])
+        return left
+
+    def factor():
+        nonlocal i
+        if i >= len(tokens):
+            raise ValueError("incomplete expression")
+        kind, words = tokens[i]
+        i += 1
+        if kind == "NOT":
+            return ("not", [factor()])
+        if kind == "(":
+            inner = expr()
+            if i >= len(tokens) or tokens[i][0] != ")":
+                raise ValueError("missing )")
+            i += 1
+            return inner
+        if kind == "word":
+            return ("word", words)
+        raise ValueError(f"unexpected {kind}")
+
+    if not tokens:
+        return None
+    tree = expr()
+    if i != len(tokens):
+        raise ValueError("unexpected )")
+    return tree
+
+
+def _fts(tree):
+    kind, items = tree
+    if kind == "word":
+        return '"' + " ".join(w.replace('"', "") for w in items) + '"'
+    if kind == "not":
+        raise ValueError("NOT needs a left side")
+    if kind == "and":
+        left, right = items
+        if right[0] == "not":
+            return f"({_fts(left)} NOT {_fts(right[1][0])})"
+        if left[0] == "not":
+            return f"({_fts(right)} NOT {_fts(left[1][0])})"
+        return f"({_fts(left)} AND {_fts(right)})"
+    return f"({_fts(items[0])} OR {_fts(items[1])})"
+
+
+def text_match(tree, words):
+    """Evaluate a parsed _text/_content query against a document's normalized words (oracle)."""
+    kind, items = tree
+    if kind == "word":
+        n = len(items)
+        terms = [normalize(w) for w in items]
+        return any(words[k:k + n] == terms for k in range(len(words) - n + 1))
+    if kind == "not":
+        return not text_match(items[0], words)
+    if kind == "and":
+        return text_match(items[0], words) and text_match(items[1], words)
+    return text_match(items[0], words) or text_match(items[1], words)
 
 
 def _distance_km(lat1, lon1, lat2, lon2):
@@ -195,6 +302,10 @@ class Engine:
             text = body.decode("utf-8") if isinstance(body, bytes) else (body or "")
             query = "&".join(q for q in (parts.query, text.strip()) if q)
             target = route[: -len("_search")].rstrip("/") or "/"
+            segs = [x for x in target.strip("/").split("/") if x]
+            if not (len(segs) in (0, 1, 3)) or segs[:1] == ["metadata"] or "_history" in segs:
+                raise SearchError(400, "POST _search applies to [base], [type] and [compartment]/[id]/[type] only",
+                                  "not-supported")
         except SearchError as exc:
             return exc.status, operation_outcome(exc)
         except UnicodeDecodeError:
@@ -212,9 +323,15 @@ class Engine:
     def _get(self, path, handling):
         parts = urlsplit(path)
         for name, value in parse_qsl(parts.query, keep_blank_values=True):
-            if name == "_format" and value.split(";")[0].strip().lower() not in JSON_FORMATS:
+            # an unescaped '+' in application/fhir+json arrives as a space after form decoding
+            if name == "_format" and value and value.split(";")[0].strip().lower().replace(" ", "+") not in JSON_FORMATS:
                 raise SearchError(406, f'Unsupported _format "{value}": only JSON is supported', "not-supported")
-        segments = [s for s in parts.path.strip("/").split("/") if s]
+        segments = [unquote(s) for s in parts.path.strip("/").split("/") if s]
+        if any(s.startswith("$") for s in segments):
+            raise SearchError(400, "Operations are not supported (read-only search endpoint)", "not-supported")
+        if "_history" in segments and not (len(segments) == 4 and segments[2] == "_history"):
+            raise SearchError(400, "The history interaction is not supported (read-only search store; every resource "
+                                   "has version 1)", "not-supported")
         if not segments:
             pairs = dict(parse_qsl(parts.query, keep_blank_values=True))
             if pairs.get("_page"):
@@ -225,16 +342,15 @@ class Engine:
         if len(segments) == 1:
             return self.search(self._type(segments[0]), parts.query, 0, handling=handling)
         if len(segments) == 2:
-            return self.read(self._type(segments[0]), segments[1])
+            return self._read_params(self.read(self._type(segments[0]), segments[1]), parts.query, handling)
         if len(segments) == 4 and segments[2] == "_history":                      # vread
-            return self.vread(self._type(segments[0]), segments[1], segments[3])
-        if len(segments) == 3 and segments[2] == "_history":
-            raise SearchError(400, "The history interaction is not supported (read-only search store; every resource has version 1)",
-                              "not-supported")
+            return self._read_params(self.vread(self._type(segments[0]), segments[1], segments[3]), parts.query, handling)
         if len(segments) == 3:                                                    # compartment search
             comp, cid, rtype = self._type(segments[0]), segments[1], segments[2]
             if comp not in self.compartments:
                 raise SearchError(400, f"{comp} is not a compartment on this server")
+            if rtype == "*":                                                      # every type in the compartment
+                return self.search(None, parts.query, 0, handling=handling, compartment=[comp, cid])
             return self.search(self._type(rtype), parts.query, 0, handling=handling, compartment=[comp, cid])
         raise SearchError(400, f"Unsupported request path: {parts.path}")
 
@@ -244,6 +360,34 @@ class Engine:
         if not row:
             raise SearchError(404, f"Resource {rtype}/{rid} is not known", "not-found")
         return json.loads(zlib.decompress(row[0]))
+
+    def _read_params(self, resource, query, handling):
+        """read / vread take _summary, _elements, _format and _pretty; anything else is an
+        error under strict handling and ignored under lenient."""
+        controls = {}
+        for name, value in parse_qsl(query, keep_blank_values=True):
+            if value == "":
+                continue
+            if name not in READ_PARAMETERS:
+                if handling == "lenient":
+                    continue
+                raise SearchError(400, f'Parameter "{name}" is not supported on read (only _summary, _elements, '
+                                       f'_format, _pretty)', "not-supported")
+            controls.setdefault(name, []).append(value)
+        for name, values in controls.items():
+            problem = _control_problem(name, values)
+            if problem or (name == "_summary" and values[-1] == "count"):
+                raise SearchError(400, problem or "_summary=count does not apply to read", "not-supported")
+        summary = (controls.get("_summary") or [None])[-1]
+        elements = [e for v in controls.get("_elements", []) for e in v.split(",") if e]
+        if summary and elements:
+            raise SearchError(400, "_summary and _elements cannot be used together")
+        for name in elements:
+            if not self._is_element(resource["resourceType"], name):
+                raise SearchError(400, f'_elements: "{name}" is not an element of {resource["resourceType"]}')
+        if summary in ("true", "text", "data") or elements:
+            return self.subset(resource, summary, elements)
+        return resource
 
     def vread(self, rtype, rid, vid):
         resource = self.read(rtype, rid)
@@ -262,14 +406,14 @@ class Engine:
         except Exception as exc:                       # any tampering is a client error, never a crash
             raise SearchError(400, "Invalid page link") from exc
         return self.search(rtype, query, offset, count_override=pairs.get("_count"), handling=handling,
-                           compartment=compartment)
+                           compartment=compartment, paged=True)
 
     def _page_link(self, relation, state, offset, size):
         token = base64.urlsafe_b64encode(zlib.compress(json.dumps(state).encode())).decode()
         return {"relation": relation, "url": f"{self.base}?_page={token}&_offset={offset}&_count={size}"}
 
     # ---- search -----------------------------------------------------------
-    def search(self, rtype, query, offset, count_override=None, handling="strict", compartment=None):
+    def search(self, rtype, query, offset, count_override=None, handling="strict", compartment=None, paged=False):
         """Type search (rtype), whole-system search (rtype None; _type or every type) or
         compartment search (compartment = [type, id])."""
         try:
@@ -279,11 +423,13 @@ class Engine:
         controls, criteria = {}, []
         types_hint = [rtype] if rtype else None
         for name, value in pairs:
+            if value == "":
+                continue                                   # R4: empty parameters are ignored
             if name.split(":", 1)[0] in CONTROL:
                 controls.setdefault(name, []).append(value)
             elif name == "_type" and rtype is None:
                 controls.setdefault("_type", []).append(value)
-            elif value != "":
+            else:
                 criteria.append((name, value))
         # Result parameters the store cannot honour are never silently dropped: an error under
         # handling=strict, an ignored-parameter warning under lenient.
@@ -298,6 +444,9 @@ class Engine:
         size = self.page_size(count_override or (controls.get("_count") or [None])[-1])
         if controls.get("_summary") and controls.get("_elements"):
             raise SearchError(400, "_summary and _elements cannot be used together")
+        if (controls.get("_summary") or [None])[-1] == "text" and any(k.split(":")[0] in ("_include", "_revinclude")
+                                                                     for k in controls):
+            raise SearchError(400, "_include and _revinclude cannot be mixed with _summary=text")
         contained = (controls.get("_contained") or ["false"])[-1]
         container_mode = (controls.get("_containedType") or ["container"])[-1] == "container"
         if controls.get("_containedType") and contained == "false":
@@ -309,7 +458,14 @@ class Engine:
             if not any(self._is_element(t, name) for t in (types_hint or self.known)):
                 raise SearchError(400, f'_elements: "{name}" is not an element of {" or ".join(types_hint or ["the searched types"])}')
         if rtype is None:
-            types = [self._type(t) for v in controls.get("_type", []) for t in v.split(",") if t] or sorted(self.known)
+            types = set(self.known)
+            for v in controls.get("_type", []):            # repeated _type parameters are AND
+                types &= {self._type(t) for t in v.split(",") if t}
+            if compartment:
+                types &= {t for t, codes in self.compartments.get(compartment[0], {}).items() if codes}
+            types = sorted(types)
+            if not types:
+                return self._empty_bundle()
         else:
             types = [rtype]
         self._alias = count(1)          # same query -> same SQL, so later pages hit the result cache
@@ -327,6 +483,18 @@ class Engine:
             if compartment:
                 crits.append(self.compartment_crit(t, *compartment))
             plans.append((t, crits))
+        sort_keys = []
+        for v in controls.get("_sort", []):
+            for key in (k for k in v.split(",") if k):
+                name = key.lstrip("-")
+                if name not in ("_id", "_lastUpdated") and name not in self.known.get(types[0], ()):
+                    if handling != "lenient":
+                        self.param(types[0], name)          # raises the unknown-parameter error
+                    ignored.append("_sort")
+                    continue
+                sort_keys.append(key)
+        if "_sort" in controls:
+            controls["_sort"] = [",".join(sort_keys)] if sort_keys else []
         ignored = sorted(set(ignored) | set(dropped))
         self.check_includes(types, controls)
         if rtype is None and any(k.lstrip("-") not in ("_id", "_lastUpdated")
@@ -342,10 +510,33 @@ class Engine:
         # _count=0 is answered like _summary=count: the total, no entries.
         if (controls.get("_total") or [None])[-1] != "none" or summary == "count" or size == 0:
             bundle["total"] = total
-        used = "&".join(f"{quote(n, safe=':._-')}={quote(v, safe='|:/$,._-')}" for n, v in pairs if n not in ignored)
-        path = (f"/{compartment[0]}/{compartment[1]}/{rtype}" if compartment else f"/{rtype}" if rtype else "")
+        # self: the parameters actually used (R4 conformance): no empty or ignored ones, the
+        # last value of single-valued result parameters, _count as applied
+        effective, seen_single = [], set()
+        for n, v in reversed(pairs):
+            base = n.split(":", 1)[0]
+            if v == "" or n in ignored or base in ignored:
+                continue
+            if base in SINGLE_CONTROLS:
+                if base in seen_single:
+                    continue
+                seen_single.add(base)
+                if base == "_count":
+                    v = str(size)
+            if base == "_sort":
+                if not controls.get("_sort") or not controls["_sort"][0]:
+                    continue
+                v = controls["_sort"][0]
+                if "_sort" in seen_single:
+                    continue
+                seen_single.add("_sort")
+            effective.append((n, v))
+        used = "&".join(f"{quote(n, safe=':._-')}={quote(v, safe='|:/$,._-')}" for n, v in reversed(effective))
+        path = (f"/{compartment[0]}/{compartment[1]}/{rtype or '*'}" if compartment else f"/{rtype}" if rtype else "")
         links = [{"relation": "self", "url": f"{self.base}{path}" + (f"?{used}" if used else "")}]
         state = [rtype, query, compartment]
+        if paged:
+            links = [self._page_link("self", state, offset, size)]
         if summary != "count" and size:
             if offset + size < total:
                 links.append(self._page_link("next", state, offset + size, size))
@@ -367,6 +558,11 @@ class Engine:
         if entries:
             bundle["entry"] = entries
         return bundle
+
+    def _empty_bundle(self):
+        return {"resourceType": "Bundle", "id": str(uuid.uuid4()),
+                "meta": {"lastUpdated": datetime.now(timezone.utc).isoformat(timespec="milliseconds")},
+                "type": "searchset", "total": 0}
 
     def page_size(self, value):
         if value is None:
@@ -635,6 +831,8 @@ class Engine:
         if code in ("_content", "_text"):
             return self.fulltext_crit(code, modifier, value)
         if modifier == "missing":
+            if p["ptype"] == "composite":
+                raise SearchError(400, f"Modifiers are not used on composite parameters ({code})")
             if p["ptype"] == "special":
                 return self.missing({**p, "ptype": "position"}, value)
             return self.missing(p, value)
@@ -708,9 +906,15 @@ class Engine:
         column = "content" if code == "_content" else "narrative"
         alternatives = []
         for v in split_or(value):
-            terms = re.findall(r"\w+", unescape(v))
-            if terms:
-                alternatives.append("(" + " AND ".join('"' + t.replace('"', '') + '"' for t in terms) + ")")
+            try:
+                tree = parse_text_query(unescape(v))
+            except ValueError as exc:
+                raise SearchError(400, f'Invalid {code} value "{v}": {exc}') from exc
+            if tree is not None:
+                try:
+                    alternatives.append(_fts(tree))
+                except ValueError as exc:
+                    raise SearchError(400, f'Invalid {code} value "{v}": {exc}') from exc
         if not alternatives:
             raise SearchError(400, f'Invalid {code} value "{value}"')
         match = f"{column} : ({' OR '.join(alternatives)})"
@@ -833,9 +1037,10 @@ class Engine:
                 raise SearchError(400, f"Functional list {v} is not defined on this server", "not-supported")
             row = self.db.execute("SELECT pid FROM resources WHERE type_id = ? AND id = ? AND container IS NULL",
                                   (self.sid("List"), v)).fetchone() if item else None
-            if not row:
-                raise SearchError(404, f"List/{v} is not known", "not-found")
-            lists.append(str(row[0]))
+            if row:
+                lists.append(str(row[0]))
+        if not lists:
+            return Crit("0")                  # R4: a logical condition (unknown list) gives an empty set
         t, marks = self.alias(), ",".join(lists)
         cond = (f"EXISTS (SELECT 1 FROM sp_ref {t} WHERE {t}.pid IN ({marks}) AND {t}.param = {item['id']} "
                 f"AND {t}.target_type = {{a}}.type_id AND {t}.target_id = {{a}}.id)")
@@ -879,6 +1084,13 @@ class Engine:
             if rtype is None and len(p["targets"]) == 1:
                 rtype = p["targets"][0]
             if rtype is None:
+                kinds = [self.sid(t) for t in p["targets"] if self.sid(t) > 0]
+                found = self.db.execute(
+                    f"SELECT COUNT(DISTINCT type_id) FROM resources WHERE id = ? AND container IS NULL "
+                    f"AND type_id IN ({','.join(map(str, kinds)) or '0'})", (rid,)).fetchone()[0]
+                if found > 1:
+                    raise SearchError(400, f'"{rid}" names resources of more than one type that {p["code"]} can '
+                                           f"reference; use Type/{rid}")
                 clauses.append("t.target_id = ?")
                 args.append(rid)
             else:
@@ -995,9 +1207,15 @@ class Engine:
     def uri_crit(self, p, modifier, value):
         if modifier not in (None, "below", "above"):
             raise SearchError(400, f"Unsupported modifier :{modifier} for uri parameter {p['code']}")
-        clauses, args = [], []
+        clauses, args, versioned = [], [], []
+        version_param = self.params.get((p["type"], "version"))
         for v in split_or(value):
             v = unescape(v)
+            if modifier and not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", v):
+                raise SearchError(400, f":{modifier} applies only to URLs, not to URNs such as OIDs (\"{v}\")")
+            if not modifier and "|" in v and version_param and "version" in self.known.get(p["type"], ()):
+                versioned.append(v.split("|", 1))           # canonical url|version: url and version
+                continue
             if modifier == "below":
                 clauses.append("substr(t.uri, 1, ?) = ?")
                 args += [len(v), v]
@@ -1007,7 +1225,14 @@ class Engine:
             else:
                 clauses.append("t.uri = ?")
                 args.append(v)
-        return self._exists("sp_uri", p, " OR ".join(clauses), args, RANK["uri"])
+        crits = [self._exists("sp_uri", p, " OR ".join(clauses), args, RANK["uri"])] if clauses else []
+        for url, version in versioned:
+            a = self._exists("sp_uri", p, "t.uri = ?", [url], RANK["uri"])
+            b = self.token_crit(version_param, None, version.replace(",", "\\,"))
+            # the driver must select exactly the matches: _where does not re-check a driving criterion
+            crits.append(Crit(f"({a.cond} AND {b.cond})", a.args + b.args, f"{a.driver} INTERSECT {b.driver}",
+                              a.driver_args + b.driver_args, RANK["uri"]))
+        return crits[0] if len(crits) == 1 else _any(crits)
 
     def composite_crit(self, p, modifier, value):
         if modifier or len(p["components"]) != 2:
@@ -1057,7 +1282,7 @@ class Engine:
                 sql, a = nested.on(c)
                 branches.append((tid, f"SELECT {c}.id FROM resources {c} WHERE {c}.type_id = {tid} AND {sql}", a))
         if not branches:
-            raise SearchError(400, f"Invalid parameter chain: {code}.{rest}")
+            raise SearchError(400, f"Invalid parameter chain: {code}.{rest}", "not-supported")
         # One indexed (param, target_id, target_type) probe per target type.
         t = self.alias()
         match = " OR ".join(f"({t}.target_type = {tid} AND {t}.target_id IN ({ids}))" for tid, ids, _ in branches)

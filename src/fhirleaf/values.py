@@ -139,10 +139,12 @@ def number_bounds(text):
 
 
 def normalize(text):
-    """String index normalization (spec: case- and accent-insensitive matching); never truncated."""
+    """String index normalization: case-, accent- and punctuation-insensitive, whitespace runs as one
+    space (R4 string search); never truncated."""
     decomposed = unicodedata.normalize("NFD", text)
-    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
-    return stripped.upper()
+    stripped = "".join(c for c in decomposed
+                       if not unicodedata.combining(c) and not unicodedata.category(c).startswith("P"))
+    return " ".join(stripped.upper().split())
 
 
 SOUNDEX = {**dict.fromkeys("BFPV", "1"), **dict.fromkeys("CGJKQSXZ", "2"), **dict.fromkeys("DT", "3"),

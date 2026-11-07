@@ -52,6 +52,17 @@ FIXTURE = [
      "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
      "subject": {"reference": "Patient/p3"}, "period": {"start": "2019-01-01T00:00:00Z", "end": "2019-01-02T00:00:00Z"},
      "location": [{"location": {"reference": "Location/loc5"}}]},
+    {"resourceType": "Invoice", "id": "inv1", "status": "issued", "subject": {"reference": "Patient/p3"},
+     "totalGross": {"value": 40, "currency": "USD"}},
+    {"resourceType": "ServiceRequest", "id": "sr1", "status": "active", "intent": "order", "subject": {"reference": "Patient/p3"},
+     "occurrenceTiming": {"repeat": {"boundsPeriod": {"start": "2013-01-31", "end": "2013-03-24"}, "frequency": 1,
+                                     "period": 2, "periodUnit": "d"}}},
+    {"resourceType": "ServiceRequest", "id": "sr2", "status": "active", "intent": "order", "subject": {"reference": "Patient/p3"},
+     "occurrenceTiming": {"event": ["2013-01-31", "2013-03-24"]}},
+    {"resourceType": "Group", "id": "loc2", "type": "person", "actual": True},
+    {"resourceType": "ValueSet", "id": "vs1", "url": "http://example.org/vs/1", "version": "2.0", "status": "active"},
+    {"resourceType": "Practitioner", "id": "pr1", "name": [{"family": "Carreno Quinones", "given": ["Jose-Maria"]},
+                                                       {"family": "O'Brien"}]},
     {"resourceType": "List", "id": "list1", "status": "current", "mode": "working",
      "entry": [{"item": {"reference": "Observation/o1"}}, {"item": {"reference": "Observation/o3"}},
                {"item": {"reference": "Condition/c1"}}]},
@@ -199,6 +210,8 @@ case("last-updated-lt", "common:_lastUpdated", "Patient?_lastUpdated=lt2025", ma
 # ---- reference ---------------------------------------------------------------------------
 case("ref-type-id", "reference:Type/id", "Observation?subject=Patient/p1", match=O(*P1_OBS))
 case("ref-id-only", "reference:id", "Observation?subject=p1", match=O(*P1_OBS))
+error("err-ref-id-ambiguous", "reject:ambiguous-id", "Observation?subject=loc2", 400)
+case("ref-id-typed-not-ambiguous", "reference:Type/id", "Observation?subject=Location/loc2", match=[])
 case("ref-absolute-local", "reference:absolute-local", "Observation?subject=http://localhost/fhir/Patient/p2", match=O("o4", "o5"))
 case("ref-relative-matches-absolute-local", "reference:absolute-local", "Observation?subject=Patient/p2", match=O("o4", "o5"))
 case("ref-absolute-external", "reference:absolute-external", "Observation?subject=http://other.org/fhir/Patient/p1", match=O("o6"))
@@ -316,6 +329,12 @@ case("near-default", "special:near-default", "Location?near=42.0|-71.0", match=L
 case("near-missing", "special:missing", "Location?near:missing=true", match=LO("loc3", "loc4", "loc5"))
 # ---- full text ---------------------------------------------------------------------------
 case("text-narrative", "fulltext:_text", "Condition?_text=diabetes", match=["Condition/c1"])
+case("content-boolean-and", "fulltext:boolean", "Observation?_content=hello%20AND%20world", match=O("o7"))
+case("content-boolean-or", "fulltext:boolean", "Observation?_content=(nosuchword%20OR%20hello)%20world", match=O("o7"))
+case("content-boolean-not", "fulltext:boolean", "Observation?_content=hello%20NOT%20world", match=[])
+case("content-phrase", "fulltext:boolean", "Observation?_content=%22hello%20world%22", match=O("o7"))
+case("content-phrase-order", "fulltext:boolean", "Observation?_content=%22world%20hello%22", match=[])
+error("err-content-syntax", "reject:bad-value", "Observation?_content=(hello", 400)
 case("content", "fulltext:_content", "Condition?_content=hypertension", match=["Condition/c2"])
 case("content-or", "fulltext:_content common:or", "Condition?_content=diabetes,hypertension", match=["Condition/c1", "Condition/c2"])
 case("content-and", "fulltext:_content", "Condition?_content=diabetes%20hypertension", match=[])
@@ -396,9 +415,54 @@ case("pretty", "result:_pretty", "Patient?_id=p1&_pretty=true", match=Pt("p1"))
 # ---- interactions ------------------------------------------------------------------------
 case("read", "interaction:read", "Patient/p1", read="Patient/p1")
 case("metadata", "interaction:metadata", "metadata", resource_type="CapabilityStatement")
+case("format-fhir-plus", "result:_format", "metadata?_format=application/fhir+json", resource_type="CapabilityStatement")
+case("read-percent-path", "interaction:read", "Patient/p%31", read="Patient/p1")
+case("read-summary", "interaction:read-params", "Patient/p1?_summary=true", read="Patient/p1", read_subsetted=True)
+case("read-elements", "interaction:read-params", "Patient/p1?_elements=gender", read="Patient/p1",
+     read_keys=["resourceType", "id", "meta", "gender"])
+case("read-format", "interaction:read-params", "Patient/p1?_format=json", read="Patient/p1", read_subsetted=False)
+error("err-read-unknown-param", "interaction:read-params reject:unknown-param", "Patient/p1?bogus=1", 400)
+case("read-unknown-param-lenient", "interaction:read-params handling:lenient", "Patient/p1?bogus=1", read="Patient/p1",
+     handling="lenient")
+case("compartment-all-types", "interaction:compartment-all", "Patient/p3/*?_type=Encounter,Invoice",
+     match=["Encounter/e3", "Invoice/inv1"])
+case("money", "quantity:money", "Invoice?totalgross=40", match=["Invoice/inv1"])
+case("money-currency", "quantity:money", "Invoice?totalgross=40|urn:iso:std:iso:4217|USD", match=["Invoice/inv1"])
+case("money-gt", "quantity:money", "Invoice?totalgross=gt40", match=[])
+case("timing-bounds-ge", "date:timing", "ServiceRequest?occurrence=ge2013-02-01",
+     match=["ServiceRequest/sr1", "ServiceRequest/sr2"])
+case("timing-outer-sa", "date:timing", "ServiceRequest?occurrence=sa2013-02-01", match=[])
+case("timing-outer-eq-month", "date:timing", "ServiceRequest?occurrence=eq2013-03", match=[])
+case("timing-outer-eq-year", "date:timing", "ServiceRequest?occurrence=eq2013",
+     match=["ServiceRequest/sr1", "ServiceRequest/sr2"])
+case("token-case-insensitive", "token:case-insensitive", "Patient?gender=MALE", match=Pt("p2"))
+case("uri-canonical-version", "uri:version", "ValueSet?url=http://example.org/vs/1|2.0", match=["ValueSet/vs1"])
+case("uri-canonical-other-version", "uri:version", "ValueSet?url=http://example.org/vs/1|3.0", match=[])
+error("err-uri-below-urn", "reject:urn-modifier", "ValueSet?url:below=urn:oid:1.2", 400)
+case("string-family-part", "string:family-part", "Practitioner?family=Quinones", match=["Practitioner/pr1"])
+case("string-family-part-exact", "string:family-part", "Practitioner?family:exact=Quinones", match=[])
+case("string-punctuation", "string:punctuation", "Practitioner?family=obrien", match=["Practitioner/pr1"])
+case("string-hyphen", "string:punctuation", "Practitioner?given=josemaria", match=["Practitioner/pr1"])
+case("string-whitespace", "string:punctuation", "Practitioner?family=carreno%20%20%09quinones", match=["Practitioner/pr1"])
+case("empty-result-params", "common:empty", "Patient?gender=male&_count=&_summary=&_sort=&_include=", match=Pt("p2"),
+     self="/Patient?gender=male")
+case("self-effective", "result:self", "Observation?code=8867-4&_count=100&_count=2&code=", self="/Observation?code=8867-4&_count=2")
+case("self-count-capped", "result:self", "Observation?code=8867-4&_count=100", self="/Observation?code=8867-4&_count=6")
+case("page-self", "result:self interaction:paging", "Observation?code=8867-4&_count=1", page_self=True)
+case("type-and", "interaction:system", "?_type=Observation,Patient&_type=Patient&_id=p1", match=Pt("p1"))
+case("type-and-empty", "interaction:system", "?_type=Observation&_type=Patient", match=[], total=0)
+error("err-summary-text-include", "reject:result-param", "Observation?_include=Observation:subject&_summary=text", 400)
+error("err-composite-missing", "reject:bad-modifier", "Observation?code-value-quantity:missing=true", 400)
+case("lenient-sort-unknown", "handling:lenient", "Observation?code=8867-4&_sort=nosuch", handling="lenient", outcome=True)
+case("lenient-chain-unknown", "handling:lenient", "Observation?code=8867-4&patient.nosuch=1", handling="lenient", outcome=True)
+error("err-sort-unknown", "reject:unknown-param", "Observation?_sort=nosuch", 400)
 case("vread", "interaction:vread", "Patient/p1/_history/1", read="Patient/p1")
 error("err-vread-version", "interaction:vread reject:unknown-id", "Patient/p1/_history/2", 404)
 error("err-history", "reject:history", "Patient/p1/_history", 400)
+error("err-history-type", "reject:history", "Patient/_history", 400)
+error("err-history-system", "reject:history", "_history", 400)
+error("err-operation", "reject:operation", "Patient/p1/$everything", 400)
+error("err-operation-type", "reject:operation", "Patient/$match", 400)
 error("err-of-type-parts", "reject:bad-value", "Patient?identifier:of-type=MR|111", 400)
 case("compartment", "interaction:compartment", "Patient/p1/Observation", match=O(*P1_OBS))
 case("compartment-condition", "interaction:compartment", "Patient/p1/Condition", match=["Condition/c1"])
@@ -423,7 +487,7 @@ error("err-in-partial", "reject:valueset", "Observation?code:in=http://example.o
 error("err-chain-not-reference", "reject:chain", "Observation?code.name=x", 400)
 error("err-hierarchy-none", "reject:hierarchy", "Encounter?subject:below=Patient/p1", 200, note="Patient.link makes Patient hierarchical")
 error("err-hierarchy-absent", "reject:hierarchy", "MedicationRequest?requester:below=Practitioner/x", 400)
-error("err-list-unknown", "reject:list", "Observation?_list=nope", 404)
+case("list-unknown-empty", "common:_list", "Observation?_list=nope", match=[])
 error("err-list-functional", "reject:list", "Observation?_list=$current-problems", 400)
 error("err-has-not-reference", "reject:chain", "Patient?_has:Observation:code:code=1", 400)
 error("err-summary-value", "reject:result-param", "Observation?_summary=garbage", 400)
@@ -448,7 +512,28 @@ http("http-post-compartment", "interaction:post-compartment", "POST", "/Patient/
      headers={"Content-Type": "application/x-www-form-urlencoded"}, body="", match=O(*P1_OBS))
 http("http-put", "reject:method", "PUT", "/Patient/p1", 405, headers={"Content-Type": "application/fhir+json"}, body="{}")
 http("http-delete", "reject:method", "DELETE", "/Patient/p1", 405)
-http("http-post-not-search", "reject:method", "POST", "/Patient", 405, headers={"Content-Type": "application/x-www-form-urlencoded"}, body="x=1")
+http("http-post-not-search", "reject:method http:allow", "POST", "/Patient", 405,
+     headers={"Content-Type": "application/x-www-form-urlencoded"}, body="x=1", header_equals={"Allow": "GET, HEAD"})
+http("http-put-allow", "reject:method http:allow", "PUT", "/Patient/p1", 405, headers={"Content-Type": "application/fhir+json"},
+     body="{}", header_equals={"Allow": "GET, HEAD"})
+http("http-post-read-search", "reject:method", "POST", "/Patient/p1/_search", 400,
+     headers={"Content-Type": "application/x-www-form-urlencoded"}, body="x=1")
+http("http-accept-q0", "reject:format http:accept", "GET", "/metadata", 406, headers={"Accept": "application/fhir+json;q=0"})
+http("http-accept-version", "reject:format http:accept", "GET", "/metadata", 406,
+     headers={"Accept": "application/fhir+json; fhirVersion=3.0"})
+http("http-accept-q-order", "http:accept", "GET", "/Patient/p1", 200,
+     headers={"Accept": "application/json;q=0.5, application/fhir+json"},
+     header_equals={"Content-Type": "application/fhir+json;charset=utf-8"})
+http("http-generic-json", "http:generic-type", "GET", "/Patient/p1", 200, headers={"Accept": "application/json"},
+     header_equals={"Content-Type": "application/json;charset=utf-8"})
+http("http-text-json", "http:generic-type", "GET", "/Patient/p1", 200, headers={"Accept": "text/json"},
+     header_equals={"Content-Type": "text/json;charset=utf-8"})
+http("http-older-type", "http:generic-type", "GET", "/Patient/p1", 200, headers={"Accept": "application/json+fhir"})
+http("http-format-generic", "http:generic-type", "GET", "/Patient/p1?_format=application/json", 200,
+     header_equals={"Content-Type": "application/json;charset=utf-8"})
+http("http-metadata-etag", "http:metadata-etag", "GET", "/metadata", 200, header="ETag")
+http("http-prefer-quoted", "http:prefer", "GET", "/Patient?bogus=1", 200, headers={"Prefer": 'Handling="lenient"'}, outcome=True)
+http("http-options", "reject:method", "OPTIONS", "/Patient", 405, header_equals={"Allow": "GET, HEAD"})
 http("http-accept-xml", "reject:format", "GET", "/Patient/p1", 406, headers={"Accept": "application/fhir+xml"})
 http("http-post-json-body", "reject:post-body", "POST", "/Observation/_search", 415, headers={"Content-Type": "application/json"}, body="{}")
 http("http-length-invalid", "reject:post-framing", "POST", "/Observation/_search", 400, raw="Content-Length: ²\r\n")
@@ -464,6 +549,9 @@ reference:Type/id reference:id reference:absolute-local reference:absolute-exter
 reference:chain reference:chain-typed reference:chain-multilevel reference:has reference:missing reference:type-modifier reference:identifier
 reference:below reference:above common:_list result:_containedType reject:hierarchy reject:list
 string:phonetic reject:multiple-or include:wildcard
+quantity:money date:timing token:case-insensitive uri:version string:family-part string:punctuation fulltext:boolean
+result:self interaction:read-params interaction:compartment-all reject:operation reject:ambiguous-id reject:urn-modifier
+http:allow http:accept http:generic-type http:metadata-etag http:prefer
 date:year date:month date:day date:minute date:second date:fraction date:Z date:offset date:no-offset date:missing
 date:eq date:ne date:gt date:lt date:ge date:le date:sa date:eb date:ap
 string:default string:exact string:contains string:missing

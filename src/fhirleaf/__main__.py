@@ -42,6 +42,7 @@ def main(argv=None):
     s.add_argument("--public-base", help="Base URL clients see (e.g. behind a proxy); default http://host:port/fhir")
     s.add_argument("--default-count", type=int, help="Page size when _count is absent (overrides the store)")
     s.add_argument("--max-count", type=int, help="Largest page size served (overrides the store)")
+    s.add_argument("--cors-origin", help="Send CORS headers for this origin (e.g. http://localhost:3000 or *); off by default")
     s.add_argument("--handling", choices=("strict", "lenient"), default="strict",
                    help="Unknown-parameter handling for requests without a Prefer header")
     c = sub.add_parser("corpus", help="Derive conformance requests from a store")
@@ -75,6 +76,9 @@ def main(argv=None):
     u.add_argument("--package", action="append", default=[])
     u.add_argument("--output", help="Full per-parameter table (JSON); the summary goes to stdout")
     args = p.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):        # JSON output is UTF-8 on every console
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     if args.command == "support":
         from .support import write_support
         print(json.dumps(write_support(args.definitions, args.package, args.output), ensure_ascii=False, indent=1))
@@ -105,7 +109,7 @@ def main(argv=None):
         print()
     elif args.command == "serve":
         server, url = serve(args.db, args.host, args.port, args.public_base, args.handling,
-                            args.default_count, args.max_count)
+                            args.default_count, args.max_count, cors_origin=args.cors_origin)
         print(f"FHIR_BASE_URL={url}", flush=True)
         try:
             server.serve_forever()

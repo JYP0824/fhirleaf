@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 
 from .fhirpath import ENV, QUANTITY_PROFILES, UnsupportedPath, compile_expression
@@ -68,7 +69,14 @@ def date_values(node, tz):
         high = HIGH_OPEN if end is None else date_range(end, tz)[1]
         return [(low, high)]
     if typ == "Timing" and isinstance(value, dict):
-        return [date_range(e, tz)[:2] for e in _strings(value.get("event"))]
+        # R4: scheduling details are ignored and only the outer limits matter (events and
+        # repeat.boundsPeriod together form one range)
+        ranges = [date_range(e, tz)[:2] for e in _strings(value.get("event"))]
+        bounds = (value.get("repeat") or {}).get("boundsPeriod")
+        if isinstance(bounds, dict) and (bounds.get("start") or bounds.get("end")):
+            ranges.append((LOW_OPEN if not bounds.get("start") else date_range(bounds["start"], tz)[0],
+                           HIGH_OPEN if not bounds.get("end") else date_range(bounds["end"], tz)[1]))
+        return [(min(r[0] for r in ranges), max(r[1] for r in ranges))] if ranges else []
     return []
 
 
@@ -94,6 +102,12 @@ def quantity_values(node):
     value, typ, _ = node
     if not isinstance(value, dict):
         return []
+    if typ == "Money":                  # R4 lists Money under quantity: currency as an ISO 4217 code
+        number = _number(value.get("value"))
+        if number is None:
+            return []
+        currency = value.get("currency")
+        return [(number, number, "urn:iso:std:iso:4217" if currency else None, currency, currency)]
     if typ == "Quantity" or typ in QUANTITY_PROFILES:
         number = _number(value.get("value"))
         if number is None:
@@ -257,9 +271,22 @@ class Extractor:
                         if code:
                             out["string"].add((pid_, code, word, pid))
         elif ptype == "string":
+            family_param = (p.get("expression") or "").rstrip().endswith(".family")
             for node in nodes:
                 for s in string_values(node):
                     out["string"].add((pid_, normalize(s), s, pid))
+                # R4: the parts of a family name are searched independently ("Quinones" finds
+                # "Carreno Quinones"); :exact still compares the whole value
+                if node[1] == "HumanName" and isinstance(node[0], dict):
+                    families = _strings(node[0].get("family"))
+                elif isinstance(node[0], str) and family_param:
+                    families = [node[0]]
+                else:
+                    families = []
+                for family in families:
+                    for part in re.split(r"[\s\-]+", family)[1:]:
+                        if part:
+                            out["string"].add((pid_, normalize(part), family, pid))
         elif ptype == "quantity":
             for node in nodes:
                 for low, high, system, code, unit in quantity_values(node):

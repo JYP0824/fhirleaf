@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl
 
 from .conformance import make_corpus
 from .extract import contained_resources, Extractor
-from .search import CONTROL, Engine, _date_eval, _distance_km
+from .search import CONTROL, Engine, _date_eval, _distance_km, parse_text_query, text_match
 from .inputs import conditional_key, input_files, read_file, resolve_conditional
 from .store import Definitions, _narrative, _text_leaves, load
 from .values import soundex, normalize, number_bounds, resolve_timezone, split_escaped, split_or, split_prefix, unescape
@@ -284,7 +284,7 @@ class Oracle:
             return False
         if code in ("_content", "_text"):
             doc = self.words[pid][0 if code == "_content" else 1]
-            return any(all(_phrase(doc, [normalize(w) for w in TERM.findall(term)]) for term in unescape(v).split())
+            return any(text_match(parse_text_query(unescape(v)), doc)
                        for v in split_or(value))
         p = self.e.params[(rtype, code)]
         table = {"reference": "ref", "special": "position"}.get(p["ptype"], p["ptype"])
@@ -378,17 +378,25 @@ class Oracle:
         return False
 
 
+def _fold(text):
+    """SQLite NOCASE: ASCII letters only."""
+    return text.translate(ASCII_FOLD) if isinstance(text, str) else text
+
+
+ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
 def _token(row, v):
     system, code = row
     parts = split_escaped(v, "|")
     if len(parts) == 1:
-        return code == parts[0]
+        return _fold(code) == _fold(parts[0])
     s, c = parts
     if s == "":
-        return system is None and code == c
+        return system is None and _fold(code) == _fold(c)
     if c == "":
         return system == s
-    return system == s and code == c
+    return system == s and _fold(code) == _fold(c)
 
 
 def _number(prefix, text, t_low, t_high=None):
