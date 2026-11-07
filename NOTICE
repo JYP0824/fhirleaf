@@ -1,0 +1,8 @@
+fhirleaf
+Copyright 2026 Jaeyun Park
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+fhirleaf reads the HL7 FHIR definitions (definitions.json.zip, published by HL7 under CC0)
+at load time and does not redistribute them. HL7 and FHIR are registered trademarks of
+Health Level Seven International; fhirleaf is not an HL7 product and is not endorsed by HL7.

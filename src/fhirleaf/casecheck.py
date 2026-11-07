@@ -1,0 +1,187 @@
+"""Run the specification cases (cases.py) in process and over HTTP and report contract coverage."""
+from __future__ import annotations
+
+import io
+import json
+import socket
+import tarfile
+import tempfile
+import threading
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+
+from .cases import CASES, DECLARED, FIXTURE, PACKAGE, SETTINGS
+from .search import Engine
+from .server import serve
+from .store import load
+
+
+def build_fixture(definitions_path, workdir):
+    work = Path(workdir)
+    (work / "data").mkdir(parents=True, exist_ok=True)
+    (work / "data" / "fixture.ndjson").write_text("".join(json.dumps(r) + "\n" for r in FIXTURE), encoding="utf-8")
+    package = work / "fixture-package.tgz"
+    with tarfile.open(package, "w:gz") as archive:
+        for name, obj in [("package/package.json", {"name": "fhirleaf.cases", "version": "1.0.0"})] + \
+                         [(f"package/ValueSet-{v['id']}.json", v) for v in PACKAGE]:
+            data = json.dumps(obj).encode("utf-8")
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    db = work / "fixture.sqlite"
+    load(work / "data", definitions_path, db, packages=[package], fulltext=True, hash_sources=False,
+         settings={k: v for k, v in SETTINGS.items()})
+    return db
+
+
+def _bundle_pages(fetch, first):
+    """All pages of a search: (status, [match keys], [include keys], first page body)."""
+    status, body = first
+    if status != 200 or body.get("resourceType") != "Bundle":
+        return status, None, None, body
+    matches, includes, page = [], [], body
+    while True:
+        for e in page.get("entry", []):
+            key = f"{e['resource']['resourceType']}/{e['resource'].get('id')}"
+            mode = e.get("search", {}).get("mode")
+            if mode == "match":
+                matches.append(key)
+            elif mode == "include":
+                includes.append(key)
+        nxt = [link["url"] for link in page.get("link", []) if link.get("relation") == "next"]
+        if not nxt:
+            break
+        status, page = fetch(nxt[0])
+        if status != 200:
+            return status, None, None, body
+    return 200, matches, includes, body
+
+
+def _judge(expect, status, matches, includes, body, headers=None, raw_body=b""):
+    problems = []
+    if status != expect["status"]:
+        return [f"status {status}, expected {expect['status']}: "
+                f"{json.dumps(body.get('issue', body.get('resourceType')))[:160] if isinstance(body, dict) else ''}"]
+    if status != 200:
+        if isinstance(body, dict) and body and body.get("resourceType") != "OperationOutcome":
+            problems.append("error answer is not an OperationOutcome")
+        return problems
+    if "read" in expect and f"{body.get('resourceType')}/{body.get('id')}" != expect["read"]:
+        problems.append(f"read returned {body.get('resourceType')}/{body.get('id')}")
+    if "resource_type" in expect and body.get("resourceType") != expect["resource_type"]:
+        problems.append(f"resourceType {body.get('resourceType')}")
+    if "match" in expect:
+        got, want = (matches, expect["match"]) if expect.get("order") else (sorted(matches or []), sorted(expect["match"]))
+        if got != want:
+            problems.append(f"matches {got} expected {want}")
+    if expect.get("include_unique") and len(includes or []) != len(set(includes or [])):
+        problems.append(f"included resources repeated: {includes}")
+    if "include" in expect and sorted(set(includes or [])) != sorted(expect["include"]):
+        problems.append(f"includes {sorted(set(includes or []))} expected {sorted(expect['include'])}")
+    if "total" in expect and body.get("total") != expect["total"]:
+        problems.append(f"total {body.get('total')} expected {expect['total']}")
+    if expect.get("no_total") and "total" in body:
+        problems.append("total present")
+    if "first_page" in expect:
+        n = sum(1 for e in body.get("entry", []) if e.get("search", {}).get("mode") == "match")
+        if n != expect["first_page"]:
+            problems.append(f"first page {n} entries expected {expect['first_page']}")
+    if "next" in expect and any(l.get("relation") == "next" for l in body.get("link", [])) != expect["next"]:
+        problems.append(f"next link presence != {expect['next']}")
+    first = next((e["resource"] for e in body.get("entry", []) if e.get("search", {}).get("mode") == "match"), None)
+    if "keys" in expect and (first is None or sorted(first) != sorted(expect["keys"])):
+        problems.append(f"elements {sorted(first or [])} expected {sorted(expect['keys'])}")
+    if "subsetted" in expect:
+        tagged = any(t.get("code") == "SUBSETTED" for t in ((first or {}).get("meta") or {}).get("tag", []))
+        if tagged != expect["subsetted"]:
+            problems.append(f"SUBSETTED tag {tagged} expected {expect['subsetted']}")
+    if expect.get("outcome") and not any(e.get("search", {}).get("mode") == "outcome" for e in body.get("entry", [])):
+        problems.append("no outcome entry")
+    if expect.get("empty_body") and raw_body:
+        problems.append("HEAD returned a body")
+    if "header" in expect and not (headers or {}).get(expect["header"]):
+        problems.append(f"missing header {expect['header']}")
+    return problems
+
+
+def run_cases(definitions_path, output=None):
+    work = Path(tempfile.mkdtemp(prefix="fhirleaf-cases-"))
+    db = build_fixture(definitions_path, work)
+    engine = Engine(db)
+    server, base = serve(db, port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+
+    def http_get(url, method="GET", headers=None, body=None):
+        request = urllib.request.Request(url, method=method, headers=headers or {},
+                                         data=body.encode("utf-8") if body is not None else None)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                raw = response.read()
+                return response.status, dict(response.headers), raw
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), exc.read()
+
+    def http_fetch(url):
+        status, _, raw = http_get(url)
+        return status, json.loads(raw) if raw else {}
+
+    results, coverage = [], defaultdict(lambda: {"cases": 0, "passed": 0})
+    for c in CASES:
+        expect, outcome = c["expect"], {}
+        if "path" in c:
+            handling = expect.get("handling", "strict")
+            # in process
+            first = engine.get("/" + c["path"], handling)
+            st, m, inc, body = _bundle_pages(lambda u: engine.get(u[len(engine.base):], handling), first)
+            outcome["in_process"] = _judge(expect, st, m, inc, body)
+            # over HTTP (Prefer carries the handling)
+            headers = {"Prefer": f"handling={handling}"}
+            st0, _, raw = http_get(f"{base}/{c['path']}", headers=headers)
+            st, m, inc, body = _bundle_pages(http_fetch, (st0, json.loads(raw) if raw else {}))
+            outcome["http"] = _judge(expect, st, m, inc, body)
+        else:
+            h = c["http"]
+            if h["raw"]:
+                request = (f"{h['method']} /fhir{h['path']} HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                           f"application/x-www-form-urlencoded\r\n{h['raw']}Connection: close\r\n\r\nab").encode("utf-8")
+                with socket.create_connection(("127.0.0.1", port), timeout=30) as sock:
+                    sock.sendall(request)
+                    data = b""
+                    try:
+                        while chunk := sock.recv(65536):
+                            data += chunk
+                    except socket.timeout:
+                        pass
+                status = int(data.split(b" ", 2)[1]) if data.startswith(b"HTTP/") else 0
+                body = json.loads(data.split(b"\r\n\r\n", 1)[1] or b"{}") if b"\r\n\r\n" in data else {}
+                outcome["http"] = _judge(expect, status, None, None, body)
+            else:
+                st0, headers, raw = http_get(base + h["path"], h["method"], h["headers"], h["body"])
+                body = json.loads(raw) if raw else {}
+                st, m, inc, body2 = _bundle_pages(http_fetch, (st0, body)) if h["method"] != "HEAD" else (st0, None, None, body)
+                outcome["http"] = _judge(expect, st, m, inc, body2 if body2 is not None else body, headers, raw)
+        passed = all(not v for v in outcome.values())
+        results.append({"id": c["id"], "keys": c["keys"], "passed": passed,
+                        "problems": {k: v for k, v in outcome.items() if v}})
+        for key in c["keys"]:
+            coverage[key]["cases"] += 1
+            coverage[key]["passed"] += passed
+    server.shutdown()
+    uncovered = [k for k in DECLARED if coverage[k]["passed"] == 0]
+    undeclared = sorted(k for k in coverage if k not in DECLARED)
+    failed = [r for r in results if not r["passed"]]
+    report = {"cases": len(results), "passed": len(results) - len(failed), "failed": len(failed),
+              "declared_combinations": len(DECLARED), "combinations_with_passing_case": len(DECLARED) - len(uncovered),
+              "uncovered_or_failing_combinations": uncovered, "undeclared_keys": undeclared,
+              "failures": failed, "coverage": {k: coverage[k] for k in DECLARED}}
+    if output:
+        Path(output).write_text(json.dumps(report, indent=1, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps({k: report[k] for k in ("cases", "passed", "failed", "declared_combinations",
+                                             "combinations_with_passing_case", "uncovered_or_failing_combinations",
+                                             "undeclared_keys")}, ensure_ascii=False))
+    for r in failed:
+        print(f"FAIL {r['id']}: {json.dumps(r['problems'], ensure_ascii=False)[:400]}")
+    return report
