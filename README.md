@@ -12,7 +12,7 @@ It loads FHIR data into one SQLite file and searches it on your machine, with no
 ## Quick start
 
 ```bash
-uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.0"
+uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.1"
 curl -fL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
 fhirleaf verify --cases --definitions definitions-r4.json.zip
 fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store.db
@@ -24,11 +24,11 @@ fhirleaf serve --db store.db --port 8080
 
 | Source | Command |
 |---|---|
-| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.0"` |
+| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.1"` |
 | PyPI (after release) | `uv add fhirleaf` |
-| Wheel | `uv add ./fhirleaf-0.1.0-py3-none-any.whl` |
+| Wheel | `uv add ./fhirleaf-0.1.1-py3-none-any.whl` |
 | Local checkout | `uv add --editable ./fhirleaf` |
-| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.0"` |
+| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.1"` |
 
 `pip install` takes the same sources.
 

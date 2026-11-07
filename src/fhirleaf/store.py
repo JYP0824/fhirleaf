@@ -61,7 +61,7 @@ CREATE TABLE valuesets(url TEXT PRIMARY KEY, complete INTEGER NOT NULL);
 CREATE TABLE valueset_codes(url TEXT NOT NULL, system INTEGER, code TEXT NOT NULL);
 """
 INDEXES = """
-CREATE UNIQUE INDEX resources_type_id ON resources(type_id, id);
+CREATE INDEX resources_type_id ON resources(type_id, id);
 CREATE INDEX resources_type ON resources(type_id);
 CREATE INDEX sp_token_value ON sp_token(param, code, system);
 CREATE INDEX sp_token_pid ON sp_token(pid, param);
@@ -253,6 +253,33 @@ class Definitions:
         return complete, codes
 
 
+def _drop_duplicates(db, counts, strings):
+    """Resources loaded more than once from bulk NDJSON: keep the first copy of identical ones,
+    stop on conflicting ones. Returns the number of copies removed."""
+    names = {sid: value for value, sid in strings.items()}
+    extra = []
+    groups = db.execute("SELECT type_id, id, GROUP_CONCAT(pid) FROM resources INDEXED BY resources_type_id "
+                        "GROUP BY type_id, id HAVING COUNT(*) > 1").fetchall()
+    for type_id, rid, pids in groups:
+        pids = sorted(int(p) for p in pids.split(","))
+        bodies = [zlib.decompress(db.execute("SELECT json FROM resources WHERE pid = ?", (p,)).fetchone()[0])
+                  for p in pids]
+        if any(b != bodies[0] for b in bodies[1:]):
+            raise ValueError(f"Conflicting duplicate resource {names.get(type_id)}/{rid}")
+        extra += pids[1:]
+        counts[names[type_id]] -= len(pids) - 1
+    if extra:
+        marks = ",".join(map(str, extra))
+        extra_sql = f"SELECT pid FROM resources WHERE pid IN ({marks}) OR container IN ({marks})"
+        tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'sp\\_%' ESCAPE '\\'")]
+        for table in tables:
+            db.execute(f"DELETE FROM {table} WHERE pid IN ({extra_sql})")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'fts'").fetchone():
+            db.execute(f"DELETE FROM fts WHERE rowid IN ({marks})")
+        db.execute(f"DELETE FROM resources WHERE pid IN ({extra_sql})")
+    return len(extra)
+
+
 def _flag(value):
     return None if value is None else int(bool(value))
 
@@ -324,7 +351,8 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
     if staging.exists():
         staging.unlink()
     db = sqlite3.connect(staging)
-    db.executescript("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;" + SCHEMA)
+    db.executescript("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; "
+                     "PRAGMA cache_size=-1048576;" + SCHEMA)
     if fulltext:
         db.execute("CREATE VIRTUAL TABLE fts USING fts5(content, narrative, tokenize='unicode61 remove_diacritics 2')")
     strings = {}
@@ -389,9 +417,10 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
             db.executemany("INSERT INTO fts(rowid, content, narrative) VALUES (?,?,?)", fts_rows)
             fts_rows.clear()
 
-    sources = []
+    sources, json_set = [], set(json_inputs)
     for path in files:
         n = 0
+        track = path in json_set
         for resource in read_file(path):
             rtype = resource.get("resourceType")
             if not rtype or not resource.get("id"):
@@ -399,13 +428,14 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
             unresolved |= resolve_conditional(resource, conditional)
             resource["meta"] = {**resource.get("meta", {}), **meta_patch}
             text = json.dumps(resource, ensure_ascii=False, separators=(",", ":"))
-            key, crc = (rtype, resource["id"]), zlib.crc32(text.encode("utf-8"))
-            if key in seen:
-                if seen[key] != crc:
-                    raise ValueError(f"Conflicting duplicate resource {rtype}/{resource['id']} in {path.name}")
-                duplicates += 1
-                continue
-            seen[key] = crc
+            if track:
+                key, crc = (rtype, resource["id"]), zlib.crc32(text.encode("utf-8"))
+                if key in seen:
+                    if seen[key] != crc:
+                        raise ValueError(f"Conflicting duplicate resource {rtype}/{resource['id']} in {path.name}")
+                    duplicates += 1
+                    continue
+                seen[key] = crc
             if rtype not in counts:
                 register(rtype)
                 counts[rtype] = 0
@@ -446,7 +476,10 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
                        ((url, intern(s) if s else None, c) for s, c in sorted(codes, key=lambda x: (x[0] or "", x[1]))))
     db.executemany("INSERT INTO strings VALUES (?,?)", ((sid, value) for value, sid in strings.items()))
     print(f"indexing {pid} resources", flush=True)
-    db.executescript(INDEXES)
+    first, _, rest = INDEXES.strip().partition("\n")
+    db.execute(first)                           # resources(type_id, id); then (type, id) must be unique
+    duplicates += _drop_duplicates(db, counts, strings)
+    db.executescript(rest)
     db.execute("ANALYZE")
     supported = {(p["type"], p["code"]) for items in extractor.by_type.values() for p, _, _ in items}
     supported |= {(t, c) for t in counts for c in ("_id", "_lastUpdated")}

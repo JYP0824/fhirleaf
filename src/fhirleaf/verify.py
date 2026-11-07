@@ -43,49 +43,65 @@ def _refs(node, out):
     return out
 
 
+def _first_type(path):
+    """resourceType of the first resource of an NDJSON file (bulk files hold one type);
+    None for Bundle/JSON files, which may hold any type."""
+    if not path.name.endswith((".ndjson", ".ndjson.gz")):
+        return None
+    for r in read_file(path):
+        return r["resourceType"]
+    return ""
+
+
 def subset(inputs, output, *, patients=5, seed=42):
     """A few patients' resources plus everything they reference (literal or conditional),
-    written as NDJSON with conditional references resolved."""
+    written as NDJSON with conditional references resolved.
+
+    One scan of every file collects the chosen patients' resources; later passes read only
+    the files that can hold still-missing referenced resources (NDJSON files whose resource
+    type is missing, and Bundle/JSON files), so a full-size export is read about once."""
     files = input_files([inputs] if isinstance(inputs, (str, Path)) else inputs)
-    ids = sorted({r["id"] for f in files for r in read_file(f) if r["resourceType"] == "Patient"})
+    kinds = {f: _first_type(f) for f in files}
+    patient_files = [f for f in files if kinds[f] in ("Patient", None)]
+    ids = sorted({r["id"] for f in patient_files for r in read_file(f) if r["resourceType"] == "Patient"})
     chosen = {f"Patient/{i}" for i in random.Random(seed).sample(ids, min(patients, len(ids)))}
-    keep, wanted = set(), set()
+    kept, wanted, resolved = {}, set(), {}
     for f in files:
         for r in read_file(f):
             key = f"{r['resourceType']}/{r['id']}"
             refs = _refs(r, set())
             if key in chosen or refs & chosen:
-                keep.add(key)
+                kept.setdefault(key, r)
                 wanted |= refs
-    resolved = {}
-    for _ in range(4):              # close over referenced resources (Medication, Location -> Organization, ...)
-        missing = wanted - keep - set(resolved)
+    for _ in range(6):              # close over referenced resources (Medication, Location -> Organization, ...)
+        missing = wanted - set(kept) - set(resolved)
         if not missing:
             break
+        types = {m.split("/", 1)[0].split("?", 1)[0] for m in missing}
+        found = False
         for f in files:
+            if kinds[f] is not None and kinds[f] not in types:
+                continue
             for r in read_file(f):
                 key = f"{r['resourceType']}/{r['id']}"
                 hits = ({key} | set(conditional_key(r))) & missing
                 if hits:
-                    keep.add(key)
+                    found = True
+                    kept.setdefault(key, r)
                     resolved.update({h: key for h in hits if "?" in h})
                     wanted |= _refs(r, set())
+        if not found:
+            break
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
-    written = {}
-    for f in files:
-        for r in read_file(f):
-            key = f"{r['resourceType']}/{r['id']}"
-            if key in keep and key not in written:
-                resolve_conditional(r, resolved)
-                written[key] = r
     by_type = defaultdict(list)
-    for r in written.values():
+    for r in kept.values():
+        resolve_conditional(r, resolved)
         by_type[r["resourceType"]].append(r)
     for rtype, rows in by_type.items():
         with gzip.open(out / f"{rtype}.ndjson.gz", "wt", encoding="utf-8") as h:
             h.writelines(json.dumps(r) + "\n" for r in rows)
-    return sorted(chosen), len(written)
+    return sorted(chosen), len(kept)
 
 
 def _phrase(doc, terms):
