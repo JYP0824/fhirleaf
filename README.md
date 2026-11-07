@@ -12,7 +12,7 @@ It loads FHIR data into one SQLite file and searches it on your machine, with no
 ## Quick start
 
 ```bash
-uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.2"
+uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.3"
 curl -fL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
 fhirleaf verify --cases --definitions definitions-r4.json.zip
 fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store.db
@@ -24,11 +24,11 @@ fhirleaf serve --db store.db --port 8080
 
 | Source | Command |
 |---|---|
-| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.2"` |
+| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.3"` |
 | PyPI (after release) | `uv add fhirleaf` |
-| Wheel | `uv add ./fhirleaf-0.1.2-py3-none-any.whl` |
+| Wheel | `uv add ./fhirleaf-0.1.3-py3-none-any.whl` |
 | Local checkout | `uv add --editable ./fhirleaf` |
-| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.2"` |
+| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.3"` |
 
 `pip install` takes the same sources.
 
@@ -99,7 +99,7 @@ Empty parameters are ignored in both modes.
 | Command | What it checks | Result |
 |---|---|---|
 | `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP | 302/302 cases, 157/157 combinations |
-| `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching | MIMIC-IV-on-FHIR Demo 1,240/1,240, Synthea + US Core 2,431/2,431 |
+| `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching, with per-parameter coverage | MIMIC-IV-on-FHIR Demo 1,240/1,240, Synthea + US Core 2,431/2,431 |
 | `fhirleaf support --definitions D --output FILE` | Status of every SearchParameter per resource type | R4: 2,873 of 3,026 supported |
 
 Compare with another FHIR server:

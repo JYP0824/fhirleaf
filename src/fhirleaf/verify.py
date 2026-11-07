@@ -104,6 +104,21 @@ def subset(inputs, output, *, patients=5, seed=42):
     return sorted(chosen), len(kept)
 
 
+def _parameters(rtype, query):
+    """Search parameters a request exercises, as 'Type.code' (chains and _has by their first parameter)."""
+    keys = set()
+    for name, value in parse_qsl(query, keep_blank_values=True):
+        if value == "" or name.split(":", 1)[0] in CONTROL or name == "_type":
+            continue
+        if name.startswith("_has:"):
+            parts = name.split(":")
+            keys.add(f"{parts[1] if len(parts) > 1 else '?'}._has")
+            continue
+        code = name.split(".", 1)[0].split(":", 1)[0]
+        keys.add(f"{rtype or '*'}.{code}")
+    return keys
+
+
 def _phrase(doc, terms):
     n = len(terms)
     return any(doc[i:i + n] == terms for i in range(len(doc) - n + 1)) if n else False
@@ -445,7 +460,7 @@ def verify(inputs, definitions_path, output, *, packages=(), fulltext=False, pat
     engine, definitions = Engine(db), Definitions(definitions_path, packages)
     oracle = Oracle(engine, definitions)
     outcomes, kinds, examples = Counter(), defaultdict(Counter), defaultdict(list)
-    skipped = Counter()
+    skipped, by_parameter = Counter(), defaultdict(Counter)
     for line in corpus.read_text(encoding="utf-8").splitlines():
         item = json.loads(line)
         path = item["request"]
@@ -496,11 +511,19 @@ def verify(inputs, definitions_path, output, *, packages=(), fulltext=False, pat
             verdict = "subsetting"
         outcomes[verdict] += 1
         kinds[item["kind"]][verdict] += 1
+        for key in _parameters(rtype, query):
+            by_parameter[key][verdict] += 1
         if verdict != "match" and len(examples[verdict]) < 15:
             examples[verdict].append({"request": path, "engine": len(got), "expected": len(expected),
                                       "missing": sorted(set(expected) - set(got))[:3], "extra": sorted(set(got) - set(expected))[:3]})
+    coverage = {"parameters": len(by_parameter),
+                "all_match": sum(1 for v in by_parameter.values() if set(v) == {"match"}),
+                "by_resource_type": dict(Counter(k.split(".", 1)[0] for k in by_parameter)),
+                "by_parameter": {k: dict(v) for k, v in sorted(by_parameter.items())}}
     report = {"patients": chosen, "resources": kept, "outcomes": dict(outcomes), "skipped": dict(skipped),
-              "by_kind": {k: dict(v) for k, v in sorted(kinds.items())}, "examples": dict(examples)}
+              "by_kind": {k: dict(v) for k, v in sorted(kinds.items())}, "examples": dict(examples),
+              "parameter_coverage": coverage}
     (out / "verify_report.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
-    print(json.dumps({"resources": kept, "outcomes": dict(outcomes)}))
+    print(json.dumps({"resources": kept, "outcomes": dict(outcomes),
+                      "parameters_exercised": coverage["parameters"], "parameters_all_match": coverage["all_match"]}))
     return report
