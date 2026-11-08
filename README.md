@@ -1,7 +1,8 @@
-# FHIRLeaf: A local FHIR R4 RESTful search engine
+# FHIRLeaf: An embedded FHIR R4 search engine
 
-FHIRLeaf is a search engine for running FHIR R4 RESTful Search locally.
-It loads FHIR data into one SQLite file and searches it on your machine, with no FHIR server or database service to deploy.
+FHIRLeaf is an embedded FHIR R4 search engine for Python.
+It runs R4 RESTful Search on a portable SQLite file, in process or over HTTP, without deploying a FHIR server.
+A store is read-only unless it is opened writable, for create, update and delete.
 
 ## Requirements
 
@@ -12,7 +13,7 @@ It loads FHIR data into one SQLite file and searches it on your machine, with no
 ## Quick start
 
 ```bash
-uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.6"
+uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.2.0"
 curl -fL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
 fhirleaf verify --cases --definitions definitions-r4.json.zip
 fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store.db
@@ -24,11 +25,11 @@ fhirleaf serve --db store.db --port 8080
 
 | Source | Command |
 |---|---|
-| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.6"` |
+| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.2.0"` |
 | PyPI (after release) | `uv add fhirleaf` |
-| Wheel | `uv add ./fhirleaf-0.1.6-py3-none-any.whl` |
+| Wheel | `uv add ./fhirleaf-0.2.0-py3-none-any.whl` |
 | Local checkout | `uv add --editable ./fhirleaf` |
-| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.6"` |
+| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.2.0"` |
 
 `pip install` takes the same sources.
 
@@ -63,6 +64,7 @@ fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store
 During load, Bundles are unpacked and `urn:uuid:` and conditional references are resolved.
 Identical duplicates are stored once, and conflicting duplicates stop the load.
 A finished store is read-only and can be shared by many processes.
+Without `--input`, `load` makes an empty store to fill through a writable connection.
 
 ## Search
 
@@ -84,6 +86,41 @@ status, bundle = store.post("Observation/_search", b"patient=Patient/1")
 
 `get` and `post` return `(status, json)`. Paths are relative to the base.
 
+## Write
+
+Open a store writable to create, update and delete.
+It needs the definitions and packages the store was built with.
+
+```python
+store = fhirleaf.connect("store.db", writable=True, definitions="definitions-r4.json.zip")
+status, patient = store.post("Patient", {"resourceType": "Patient", "name": [{"family": "Lee"}]})
+status, patient = store.put(f"Patient/{patient['id']}", {**patient, "gender": "female"}, if_match='W/"1"')
+status, _ = store.delete(f"Patient/{patient['id']}")
+store.close()
+```
+
+```bash
+fhirleaf serve --db store.db --writable --definitions definitions-r4.json.zip
+```
+
+| Request | Result |
+|---|---|
+| `POST [type]` | `201` with `Location`, `ETag` and `Last-Modified`. The server assigns the id. |
+| `PUT [type]/[id]` | `200` with a new version, or `201` when the id is new or was deleted |
+| `PUT` with `If-Match` | `412` when no listed version is the current one |
+| `DELETE [type]/[id]` | `204`. Also `204` when there is nothing to delete. |
+| `GET [type]/[id]` after delete | `410` |
+| `GET [type]/[id]/_history/[vid]` | Any stored version. `410` for the deletion. |
+| `GET [type]/[id]/_history` | Every version, newest first, with `_count` and `_since` |
+| `Prefer: return=` | `representation` (default), `minimal`, `OperationOutcome` |
+
+A written resource is indexed exactly as `load` indexes it.
+The first writable open registers every resource type of the definitions.
+From then on every type can be searched, and date `ap` is relative to the current time.
+Writes are transactions in SQLite WAL mode. Other connections see them on their next request.
+Closing the last writer folds the WAL back into the file.
+`serve --writable` answers one request at a time.
+
 ### Unknown parameters
 
 | Mode | Result | How to select |
@@ -99,7 +136,8 @@ Empty parameters are ignored in both modes.
 
 | Command | What it checks | Result |
 |---|---|---|
-| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP | 306/306 cases, 157/157 combinations |
+| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP. CI runs them on Python 3.10, 3.12 and 3.13. | 306/306 cases, 157/157 combinations |
+| (same command) | Write steps on a writable fixture, and stores filled by writes against fresh loads of the same resources | 51/51 steps, both stores equal |
 | `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching, with per-parameter coverage | MIMIC-IV-on-FHIR Demo 1,240/1,240, Synthea + US Core 2,431/2,431 |
 | `fhirleaf support --definitions D --output FILE` | Status of every SearchParameter per resource type | R4: 2,873 of 3,026 supported |
 
@@ -127,7 +165,8 @@ fhirleaf compare --db store.db --recorded recorded.jsonl --report report.json
 | `HEAD` | Headers only |
 | Other methods | `405` with `Allow: GET, HEAD` |
 | Resource type without loaded data | `404` (not listed in `metadata`) |
-| History, operations (`$...`) | `400` |
+| History, operations (`$...`) | `400` (instance history in a writable store, see Write) |
+| Create, update, delete | `405`, unless the store is opened writable |
 
 Responses use the requested JSON type: `application/fhir+json` (default), `application/json`,
 `text/json` or `application/json+fhir`, chosen by `_format` or by `Accept` with q-values.
@@ -180,8 +219,11 @@ The `self` link carries the parameters actually used, and on later pages it is t
 | Missing sort values | Last |
 | `near` without a distance | 1 km |
 | Phonetic matching | Letters by American Soundex, digits exactly. Every part of the value must match. |
-| `ap` reference point | Load instant (`--last-updated`), not the current time |
+| `ap` reference point | Load instant (`--last-updated`). The current time once the store is opened writable. |
 | Sort on token, reference | By code, by target id |
+| Update with the same content | No new version (`200` with the current one) |
+| References on write | Not checked. A reference may point to a missing resource. |
+| Resource content on write | Not validated against profiles. Values that cannot be indexed answer `400`. |
 
 These choices are stored in the file and reported in `metadata`.
 
@@ -189,7 +231,7 @@ These choices are stored in the file and reported in `metadata`.
 
 These requests return an error:
 
-- Create, update, patch, delete, history, batch, transaction and operations
+- Patch, conditional create, update and delete, type and system history, batch, transaction and operations
 - `_query` and `_filter`
 - Token `:above` and `:below`
 - Five R4 composites: `DocumentReference.relationship` and four `MolecularSequence` coordinates
@@ -215,6 +257,7 @@ uv publish
 ## Security
 
 `serve` has no authentication, authorisation, TLS or rate limiting.
+With `--writable` any client that reaches it can change the store.
 It binds to `127.0.0.1` by default. Expose it only behind a proxy that adds these.
 CORS is off by default. `serve --cors-origin ORIGIN` enables it for one origin.
 

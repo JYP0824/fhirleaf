@@ -1,4 +1,4 @@
-"""Build a store: FHIR resources -> one read-only SQLite file.
+"""Build a store: FHIR resources -> one SQLite file (read-only unless opened writable).
 
 The file holds the unchanged resources (plus the meta.versionId/lastUpdated a
 server assigns when storing them), search index rows extracted with the official
@@ -29,7 +29,8 @@ from .inputs import (conditional_key, conditional_references, input_files, packa
                      resolve_conditional, unpack)
 from .values import resolve_timezone
 
-VERSION = "fhirleaf-store-v3"
+VERSION = "fhirleaf-store-v4"
+READABLE = ("fhirleaf-store-v3", VERSION)      # v3 has no version tables and opens read-only only
 SCHEMA = """
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE strings(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);
@@ -61,6 +62,13 @@ CREATE TABLE sp_position(param INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT
 -- date (c2_low, c2_high) or string (normalized c2_text)
 CREATE TABLE sp_composite(param INTEGER NOT NULL, system INTEGER, code TEXT NOT NULL COLLATE NOCASE, c2_system INTEGER, c2_code TEXT COLLATE NOCASE,
                           c2_value REAL, c2_low INTEGER, c2_high INTEGER, c2_text TEXT, pid INTEGER NOT NULL);
+-- versions that are no longer current, and deletions (json NULL), written through a writable connection
+CREATE TABLE versions(type_id INTEGER NOT NULL, id TEXT NOT NULL, version INTEGER NOT NULL, updated TEXT NOT NULL,
+                      method TEXT NOT NULL, status INTEGER NOT NULL, json BLOB, PRIMARY KEY(type_id, id, version));
+-- resources (and their contained rows) written after load: lastUpdated range in microseconds and the
+-- method and status of that write. Loaded resources have no row: their lastUpdated is the load instant.
+CREATE TABLE written(pid INTEGER PRIMARY KEY, low INTEGER NOT NULL, high INTEGER NOT NULL, method TEXT NOT NULL,
+                     status INTEGER NOT NULL);
 CREATE TABLE valuesets(url TEXT PRIMARY KEY, complete INTEGER NOT NULL);
 CREATE TABLE valueset_codes(url TEXT NOT NULL, system INTEGER, code TEXT NOT NULL COLLATE NOCASE);
 """
@@ -96,6 +104,7 @@ CREATE INDEX sp_position_pid ON sp_position(pid, param);
 CREATE INDEX sp_composite_value ON sp_composite(param, code, system);
 CREATE INDEX sp_composite_pid ON sp_composite(pid, param);
 CREATE INDEX valueset_codes_value ON valueset_codes(url, code, system);
+CREATE INDEX written_low ON written(low);
 """
 INSERT = {
     "token": "INSERT INTO sp_token VALUES (?,?,?,?)",
@@ -288,8 +297,14 @@ def _flag(value):
     return None if value is None else int(bool(value))
 
 
+READ_INTERACTIONS = [{"code": "read"}, {"code": "vread"}, {"code": "search-type"}]
+WRITE_INTERACTIONS = READ_INTERACTIONS + [{"code": "create"}, {"code": "update"}, {"code": "delete"},
+                                          {"code": "history-instance"}]
+
+
 def capability(params, supported, settings, definitions, compartments):
     """CapabilityStatement listing exactly the interactions and search parameters this store answers."""
+    writable = bool(settings.get("writable"))
     by_type = {}
     for p in params:
         if (p["type"], p["code"]) in supported:
@@ -305,7 +320,8 @@ def capability(params, supported, settings, definitions, compartments):
         entries.append({"name": "_list", "type": "special"})
         resources.append({
             "type": rtype, "profile": f"http://hl7.org/fhir/StructureDefinition/{rtype}",
-            "interaction": [{"code": "read"}, {"code": "vread"}, {"code": "search-type"}],
+            "interaction": WRITE_INTERACTIONS if writable else READ_INTERACTIONS,
+            **({"versioning": "versioned-update", "readHistory": True, "updateCreate": True} if writable else {}),
             "searchParam": entries,
             "searchInclude": ["*"] + ([f"{rtype}:*"] if refs else []) + [f"{rtype}:{r}" for r in refs],
             "searchRevInclude": (["*"] if rev else []) + sorted({f"{r.split(':')[0]}:*" for r in rev}) + rev,
@@ -315,13 +331,37 @@ def capability(params, supported, settings, definitions, compartments):
             f"results without _sort are in stable store order; near without a distance uses "
             f"{settings['near_default_km']} km; phonetic parameters match name parts, letters by American Soundex and digits exactly; "
             f"token codes and identifier values compare case-insensitively (ASCII); date 'ap' is 10% of the distance "
-            f"from the load instant {settings['last_updated']}.")
+            + ("from the current time." if writable else f"from the load instant {settings['last_updated']}."))
     return {"resourceType": "CapabilityStatement", "status": "active", "kind": "instance",
             "fhirVersion": definitions.fhir_version, "date": settings["last_updated"],
             "format": ["application/fhir+json"], "software": {"name": "fhirleaf", "version": VERSION},
             "implementation": {"description": note},
             "rest": [{"mode": "server", "resource": resources, "interaction": [{"code": "search-system"}],
                       "compartment": [f"http://hl7.org/fhir/CompartmentDefinition/{c.lower()}" for c in sorted(compartments)]}]}
+
+
+def derived_meta(definitions, params, registry, counts, config):
+    """Meta entries that follow from the registered types (counts) and parameters: capability,
+    compartments and element lists. A writable connection recomputes them when it registers types."""
+    supported = {(p["type"], p["code"]) for items in registry.by_type.values() for p, _, _ in items}
+    supported |= {(t, c) for t in counts for c in ("_id", "_lastUpdated")}
+    compartments = {}
+    for code, members in definitions.compartments.items():
+        if code not in counts:
+            continue
+        compartments[code] = {t: [c for c in codes if (t, c) in supported or c == "{def}"]
+                              for t, codes in members.items() if t in counts and codes}
+    elements = definitions.model.elements
+    return {"capability": capability(params, supported, config, definitions, compartments),
+            "resource_counts": counts, "compartments": compartments,
+            "unsupported_expressions": registry.unsupported,
+            "elements": {t: sorted({path.split(".")[1].replace("[x]", "") for path in elements
+                                    if path.startswith(t + ".") and path.count(".") == 1}) for t in counts},
+            "choice_elements": {t: sorted({path.split(".")[1][:-3] for path in elements
+                                           if path.startswith(t + ".") and path.count(".") == 1 and path.endswith("[x]")})
+                                for t in counts},
+            "summary_elements": {k: sorted(v) for k, v in definitions.model.summary.items() if k in counts},
+            "mandatory_elements": {k: sorted(v) for k, v in definitions.model.mandatory.items() if k in counts}}
 
 
 def _text_leaves(node, out):
@@ -345,12 +385,13 @@ def _narrative(resource):
 def load(inputs, definitions_path, output, *, packages=(), settings=None, fulltext=False, hash_sources=True,
          batch=5000, workers=1):
     """inputs: files or directories of *.ndjson[.gz] / *.json[.gz] (Bundles or single resources).
+    No inputs make an empty store, to fill through a writable connection.
     workers > 1 parses and extracts batches in that many processes. The store is the same for any
     number of workers: batches are written in input order by this process."""
     output = Path(output)
     if output.exists():
         raise ValueError(f"Output exists; use a fresh path: {output}")
-    files = input_files([inputs] if isinstance(inputs, (str, Path)) else inputs)
+    files = input_files([inputs] if isinstance(inputs, (str, Path)) else inputs) if inputs else []
     definitions = Definitions(definitions_path, packages)
     config = {**DEFAULT_SETTINGS, **(settings or {}), "fulltext": bool(fulltext)}
     config.setdefault("last_updated", datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
@@ -517,30 +558,13 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
     duplicates += _drop_duplicates(db, counts, strings)
     db.executescript(rest)
     db.execute("ANALYZE")
-    supported = {(p["type"], p["code"]) for items in registry.by_type.values() for p, _, _ in items}
-    supported |= {(t, c) for t in counts for c in ("_id", "_lastUpdated")}
-    compartments = {}
-    for code, members in definitions.compartments.items():
-        if code not in counts:
-            continue
-        compartments[code] = {t: [c for c in codes if (t, c) in supported or c == "{def}"]
-                              for t, codes in members.items() if t in counts and codes}
     meta = {"version": VERSION, "fhir_version": definitions.fhir_version, "settings": config,
-            "capability": capability(params, supported, config, definitions, compartments),
-            "resource_counts": counts, "compartments": compartments, "sources": sources,
+            **derived_meta(definitions, params, registry, counts, config), "sources": sources,
             "definitions": {"path": os.path.basename(definitions.path), "sha256": definitions.sha256},
             "packages": definitions.packages, "duplicates_skipped": duplicates, "contained_resources": contained_count,
             "unresolved_conditional_references": sorted(unresolved)[:100], "unresolved_conditional_count": len(unresolved),
             "valuesets": {"total": len(definitions.valuesets), "complete": complete},
-            "unsupported_expressions": registry.unsupported,
-            "fhir_resource_types": sorted(definitions.model.resource_types),
-            "elements": {t: sorted({path.split(".")[1].replace("[x]", "") for path in definitions.model.elements
-                                    if path.startswith(t + ".") and path.count(".") == 1}) for t in counts},
-            "choice_elements": {t: sorted({path.split(".")[1][:-3] for path in definitions.model.elements
-                                           if path.startswith(t + ".") and path.count(".") == 1 and path.endswith("[x]")})
-                                for t in counts},
-            "summary_elements": {k: sorted(v) for k, v in definitions.model.summary.items() if k in counts},
-            "mandatory_elements": {k: sorted(v) for k, v in definitions.model.mandatory.items() if k in counts}}
+            "fhir_resource_types": sorted(definitions.model.resource_types)}
     db.executemany("INSERT INTO meta VALUES (?,?)", ((k, json.dumps(v, ensure_ascii=False)) for k, v in meta.items()))
     db.commit()
     db.close()

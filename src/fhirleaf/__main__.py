@@ -15,7 +15,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="fhirleaf", description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
     a = sub.add_parser("load", help="FHIR resources -> fresh store")
-    a.add_argument("--input", "--fhir-dir", dest="inputs", action="append", required=True,
+    a.add_argument("--input", "--fhir-dir", dest="inputs", action="append", default=[],
                    help="File or directory of *.ndjson[.gz] / *.json[.gz] (Bundles or resources); repeatable")
     a.add_argument("--package", action="append", default=[], help="FHIR package .tgz (e.g. an implementation guide); repeatable")
     a.add_argument("--fulltext", action="store_true", help="Build the full-text index for _content/_text")
@@ -45,6 +45,9 @@ def main(argv=None):
     s.add_argument("--default-count", type=int, help="Page size when _count is absent (overrides the store)")
     s.add_argument("--max-count", type=int, help="Largest page size served (overrides the store)")
     s.add_argument("--cors-origin", help="Send CORS headers for this origin (e.g. http://localhost:3000 or *); off by default")
+    s.add_argument("--writable", action="store_true", help="Also create, update and delete (needs --definitions)")
+    s.add_argument("--definitions", help="The definitions.json.zip the store was built with (for --writable)")
+    s.add_argument("--package", action="append", default=[], help="Packages the store was built with (for --writable)")
     s.add_argument("--handling", choices=("strict", "lenient"), default="strict",
                    help="Unknown-parameter handling for requests without a Prefer header")
     c = sub.add_parser("corpus", help="Derive conformance requests from a store")
@@ -88,7 +91,9 @@ def main(argv=None):
     if args.command == "verify" and args.cases:
         from .casecheck import run_cases
         report = run_cases(args.definitions, args.output)
-        raise SystemExit(0 if not report["failed"] and not report["uncovered_or_failing_combinations"] else 1)
+        ok = not (report["failed"] or report["uncovered_or_failing_combinations"] or report["write_failed"]
+                  or any(report["equivalence"].values()))
+        raise SystemExit(0 if ok else 1)
     if args.command == "verify":
         if not args.inputs or not args.output:
             p.error("verify needs --input and --output (or --cases)")
@@ -111,12 +116,16 @@ def main(argv=None):
         print()
     elif args.command == "serve":
         server, url = serve(args.db, args.host, args.port, args.public_base, args.handling,
-                            args.default_count, args.max_count, cors_origin=args.cors_origin)
+                            args.default_count, args.max_count, cors_origin=args.cors_origin, writable=args.writable,
+                            definitions=args.definitions, packages=args.package)
         print(f"FHIR_BASE_URL={url}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            if server.engine:
+                server.engine.close()
     elif args.command == "corpus":
         conformance.make_corpus(args.db, args.output, seed=args.seed, patients=args.patients,
                                 values_per_param=args.values_per_param)

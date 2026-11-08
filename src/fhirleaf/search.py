@@ -13,7 +13,7 @@ from itertools import count
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
-from .store import VERSION as STORE_VERSION
+from .store import READABLE, VERSION as STORE_VERSION
 from .values import (date_range, normalize, number_bounds, phonetic_codes, resolve_timezone, split_escaped, split_or,
                      split_prefix,
                      unescape)
@@ -56,6 +56,18 @@ CHOICE_TYPES = {"Address", "Age", "Annotation", "Attachment", "Base64Binary", "B
                 "PositiveInt", "Quantity", "Range", "Ratio", "Reference", "RelatedArtifact", "SampledData", "Signature",
                 "String", "Time", "Timing", "TriggerDefinition", "UnsignedInt", "Uri", "Url", "UsageContext", "Uuid"}
 CONTROL_MODIFIERS = {"_include": {"iterate", "recurse"}, "_revinclude": {"iterate", "recurse"}}
+REASONS = {200: "OK", 201: "Created", 204: "No Content"}
+
+
+def _version_tags(value):
+    """If-Match ETags ('2', '"2"', 'W/"2"', or a comma-separated list) -> {'2', ...}; None stays None."""
+    if value is None:
+        return None
+    tags = set()
+    for item in value.split(","):
+        item = item.strip()
+        tags.add((item[2:] if item.startswith("W/") else item).strip('"'))
+    return tags
 
 
 def _control_problem(name, values):
@@ -203,22 +215,79 @@ def _distance_km(lat1, lon1, lat2, lon2):
 
 
 class Engine:
-    def __init__(self, path, base_url="http://localhost/fhir", cache=None, default_count=None, max_count=None):
-        """default_count / max_count override the page sizes stored at load time."""
+    def __init__(self, path, base_url="http://localhost/fhir", cache=None, default_count=None, max_count=None,
+                 writable=False, definitions=None, packages=(), clock=None):
+        """default_count / max_count override the page sizes stored at load time.
+        writable: also create, update and delete (needs the definitions and packages the store was
+        built with). A read-only connection opens the file immutable unless a writer left a WAL."""
         self.path = Path(path).resolve()
-        self.db = sqlite3.connect(self.path.as_uri() + "?mode=ro&immutable=1", uri=True, check_same_thread=False)
+        if not self.path.is_file():
+            raise ValueError(f"No store at {self.path}")
+        self.writable, self.writer, self._overrides = bool(writable), None, (default_count, max_count)
+        self.base = base_url.rstrip("/")
+        self._results = cache if cache is not None else {}
+        if writable:
+            if definitions is None:
+                raise ValueError("A writable connection needs the definitions the store was built with")
+            self.db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+            self.db.execute("PRAGMA busy_timeout = 10000")
+        elif Path(str(self.path) + "-wal").exists():          # a writer is (or was) active: read its commits
+            self.db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, check_same_thread=False)
+        else:
+            self.db = sqlite3.connect(self.path.as_uri() + "?mode=ro&immutable=1", uri=True, check_same_thread=False)
+        self.live = writable or Path(str(self.path) + "-wal").exists()
         self.db.create_function("distance_km", 4, _distance_km, deterministic=True)
+        self._state()
+        if writable:
+            if not self.versioned:
+                raise ValueError(f"A writable connection needs a {STORE_VERSION} store; rebuild this one with fhirleaf load")
+            self.db.execute("PRAGMA journal_mode = WAL")
+            from .write import Writer
+            self.writer = Writer(self, definitions, packages, clock)
+            self._state()
+        self._data_version = self.db.execute("PRAGMA data_version").fetchone()[0]
+
+    def close(self):
+        """Close the connection. A writable one first folds its WAL back into the file, so the store
+        can again be opened immutable."""
+        if self.writable:
+            try:
+                self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self.db.execute("PRAGMA journal_mode = DELETE")
+            except sqlite3.OperationalError:      # other connections are open: the last writer to close folds it
+                pass
+        self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _sync(self):
+        """Another connection committed: reload the stored state and drop cached results."""
+        if self.live:
+            version = self.db.execute("PRAGMA data_version").fetchone()[0]
+            if version != self._data_version:
+                self._data_version = version
+                self._state()
+                self._results.clear()
+
+    def _state(self):
         meta = {k: json.loads(v) for k, v in self.db.execute("SELECT key, value FROM meta")}
-        if meta.get("version") != STORE_VERSION:
+        if meta.get("version") not in READABLE:
             raise ValueError(f"Store format {meta.get('version')} is not {STORE_VERSION}; rebuild it with this fhirleaf")
+        self.versioned = meta["version"] == STORE_VERSION
         self.meta, self.settings = meta, dict(meta["settings"])
+        default_count, max_count = self._overrides
         for key, value in (("default_count", default_count), ("max_count", max_count)):
             if value is not None:
                 if int(value) < 1:
                     raise ValueError(f"{key} must be at least 1")
                 self.settings[key] = int(value)
-        self.base = base_url.rstrip("/")
         self.tz = resolve_timezone(self.settings["timezone"])
+        self.history_enabled = bool(self.settings.get("writable")) and self.versioned
+        self.has_written = self.versioned and bool(self.db.execute("SELECT 1 FROM written LIMIT 1").fetchone())
         self.loaded = set(meta["resource_counts"])
         self.compartments = meta.get("compartments", {})
         self.fhir_types = set(meta.get("fhir_resource_types") or meta["resource_counts"])
@@ -240,7 +309,7 @@ class Engine:
         self.known = {res["type"]: {sp["name"] for sp in res.get("searchParam", [])}
                       for rest in self.capability.get("rest", []) for res in rest.get("resource", [])}
         self.last_updated = date_range(self.settings["last_updated"], self.tz)[:2]
-        self._ids, self._results = {}, (cache if cache is not None else {})
+        self._ids = {}
         self._contained = "false"
         self._alias = count(1)
 
@@ -291,13 +360,19 @@ class Engine:
 
     def post(self, path, body=b"", content_type="application/x-www-form-urlencoded", handling="strict"):
         """POST [base]/[type]/_search, [base]/_search or [base]/[compartment]/[id]/[type]/_search:
-        the same search as GET, with parameters from the URL and the form-encoded body (in that order)."""
+        the same search as GET, with parameters from the URL and the form-encoded body (in that order).
+        On a writable connection POST [type] with a JSON resource body is create."""
         try:
             parts = urlsplit(path)
             route = parts.path.rstrip("/")
             if not route.endswith("_search") or (route != "_search" and not route.endswith("/_search")):
-                raise SearchError(405, "Only POST .../_search (search) is supported: this endpoint is read-only",
-                                  "not-supported")
+                segs = [unquote(s) for s in route.strip("/").split("/") if s]
+                if self.writable and len(segs) == 1 and segs[0] != "metadata" and not segs[0].startswith(("$", "_")):
+                    if parts.query:
+                        raise SearchError(400, "Conditional create is not supported", "not-supported")
+                    return self._write(lambda: self.writer.create(self._type(segs[0]), self._body(body, content_type)))
+                raise SearchError(405, "Only POST .../_search (search) is supported" + (
+                    "" if self.writable else ": this store is opened read-only"), "not-supported")
             if body and content_type.split(";")[0].strip().lower() != "application/x-www-form-urlencoded":
                 raise SearchError(415, "POST _search needs an application/x-www-form-urlencoded body", "not-supported")
             text = body.decode("utf-8") if isinstance(body, bytes) else (body or "")
@@ -317,9 +392,70 @@ class Engine:
         """Answer one GET (path relative to the base). handling: 'strict' rejects unknown
         search parameters; 'lenient' ignores them and reports them in an outcome entry."""
         try:
+            self._sync()
             return 200, self._get(path, handling)
         except SearchError as exc:
             return exc.status, operation_outcome(exc)
+
+    # ---- writes (writable connections) ----------------------------------------------------
+    def put(self, path, body, content_type="application/fhir+json", if_match=None):
+        """PUT [type]/[id]: update, or create with this id. if_match: a version ('2' or W/"2")."""
+        def op():
+            rtype, rid = self._instance(path)
+            return self.writer.update(rtype, rid, self._body(body, content_type), _version_tags(if_match))
+        return self._write(op)
+
+    def delete(self, path, if_match=None):
+        """DELETE [type]/[id]: (204, None). The deletion's versionId and lastUpdated are in writer.deleted."""
+        def op():
+            rtype, rid = self._instance(path)
+            return self.writer.delete(rtype, rid, _version_tags(if_match))
+        return self._write(op)
+
+    def _write(self, op):
+        try:
+            if not self.writable:
+                raise SearchError(405, "This store is opened read-only", "not-supported")
+            self._sync()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.writer.begin()
+                status, body = op()
+                self.writer.finish()
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+        except SearchError as exc:
+            return exc.status, operation_outcome(exc)
+        self._results.clear()
+        self._ids.clear()
+        self.has_written = True
+        self.meta["resource_counts"] = self.writer.counts
+        if self.writer.changed:
+            self._state()
+        return status, body
+
+    def _instance(self, path):
+        parts = urlsplit(path)
+        if parts.query:
+            raise SearchError(400, "Conditional update and delete are not supported", "not-supported")
+        segs = [unquote(s) for s in parts.path.strip("/").split("/") if s]
+        if len(segs) != 2 or segs[1].startswith(("_", "$")):
+            raise SearchError(405, "PUT and DELETE apply to [type]/[id] only", "not-supported")
+        return self._type(segs[0]), segs[1]
+
+    @staticmethod
+    def _body(body, content_type):
+        if isinstance(body, dict):
+            return body
+        media = (content_type or "application/fhir+json").split(";")[0].strip().lower()
+        if media not in JSON_FORMATS:
+            raise SearchError(415, f"The body must be JSON (application/fhir+json), not {media}", "not-supported")
+        try:
+            return json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise SearchError(400, f"The body is not valid JSON: {exc}", "structure") from None
 
     def _get(self, path, handling):
         parts = urlsplit(path)
@@ -331,6 +467,11 @@ class Engine:
         if any(s.startswith("$") for s in segments):
             raise SearchError(400, "Operations are not supported (read-only search endpoint)", "not-supported")
         if "_history" in segments and not (len(segments) == 4 and segments[2] == "_history"):
+            if self.history_enabled and len(segments) == 3 and segments[2] == "_history":
+                return self.history(self._type(segments[0]), segments[1], parts.query, handling)
+            if self.history_enabled:
+                raise SearchError(400, "Type and system history are not supported (instance history only)",
+                                  "not-supported")
             raise SearchError(400, "The history interaction is not supported (read-only search store; every resource "
                                    "has version 1)", "not-supported")
         if not segments:
@@ -359,6 +500,11 @@ class Engine:
         row = self.db.execute("SELECT r.json FROM resources r WHERE r.type_id = ? AND r.id = ? AND r.container IS NULL",
                               (self.sid(rtype), rid)).fetchone()
         if not row:
+            if self.versioned:
+                last = self.db.execute("SELECT json IS NULL FROM versions WHERE type_id = ? AND id = ? "
+                                       "ORDER BY version DESC LIMIT 1", (self.sid(rtype), rid)).fetchone()
+                if last and last[0]:
+                    raise SearchError(410, f"Resource {rtype}/{rid} was deleted", "deleted")
             raise SearchError(404, f"Resource {rtype}/{rid} is not known", "not-found")
         return json.loads(zlib.decompress(row[0]))
 
@@ -391,10 +537,87 @@ class Engine:
         return resource
 
     def vread(self, rtype, rid, vid):
-        resource = self.read(rtype, rid)
-        if (resource.get("meta") or {}).get("versionId") != vid:
-            raise SearchError(404, f"Version {vid} of {rtype}/{rid} is not known", "not-found")
-        return resource
+        try:
+            resource = self.read(rtype, rid)
+        except SearchError as exc:
+            if exc.status != 410 or not self.versioned:
+                raise
+            resource = None
+        if resource is not None and (resource.get("meta") or {}).get("versionId") == vid:
+            return resource
+        if self.versioned and vid.isdigit():
+            row = self.db.execute("SELECT json FROM versions WHERE type_id = ? AND id = ? AND version = ?",
+                                  (self.sid(rtype), rid, int(vid))).fetchone()
+            if row and row[0] is None:
+                raise SearchError(410, f"Version {vid} of {rtype}/{rid} is its deletion", "deleted")
+            if row:
+                return json.loads(zlib.decompress(row[0]))
+        raise SearchError(404, f"Version {vid} of {rtype}/{rid} is not known", "not-found")
+
+    def history(self, rtype, rid, query, handling):
+        """GET [type]/[id]/_history: every version, newest first (_count, _since)."""
+        controls = {}
+        for name, value in parse_qsl(query, keep_blank_values=True):
+            if value == "":
+                continue
+            if name not in ("_count", "_since", "_format", "_pretty", "_offset"):
+                if handling == "lenient":
+                    continue
+                raise SearchError(400, f'Parameter "{name}" is not supported on history (only _count, _since, '
+                                       f'_format, _pretty)', "not-supported")
+            if name in controls:
+                raise SearchError(400, f"{name} may appear only once on history")
+            controls[name] = value
+        size = self.page_size(controls.get("_count"))
+        try:
+            offset = int(controls.get("_offset", "0"))
+            since = date_range(controls["_since"], self.tz)[0] if "_since" in controls else None
+        except ValueError as exc:
+            raise SearchError(400, f"Invalid history parameter: {exc}") from None
+        if offset < 0:
+            raise SearchError(400, "Invalid history page")
+        tid, items = self.sid(rtype), []
+        row = self.db.execute("SELECT pid, json FROM resources WHERE type_id = ? AND id = ? AND container IS NULL",
+                              (tid, rid)).fetchone()
+        if row:
+            resource = json.loads(zlib.decompress(row[1]))
+            method, status = self.db.execute("SELECT method, status FROM written WHERE pid = ?",
+                                             (row[0],)).fetchone() or ("PUT", 201)
+            items.append((int(resource["meta"]["versionId"]), resource["meta"]["lastUpdated"], method, status, resource))
+        for version, updated, method, status, blob in self.db.execute(
+                "SELECT version, updated, method, status, json FROM versions WHERE type_id = ? AND id = ?", (tid, rid)):
+            items.append((version, updated, method, status, json.loads(zlib.decompress(blob)) if blob else None))
+        if not items:
+            raise SearchError(404, f"Resource {rtype}/{rid} is not known", "not-found")
+        items.sort(key=lambda item: -item[0])
+        if since is not None:
+            items = [i for i in items if date_range(i[1], self.tz)[0] >= since]
+        entries = []
+        for version, updated, method, status, resource in (items[offset:offset + size] if size else []):
+            entry = {"fullUrl": f"{self.base}/{rtype}/{rid}"}
+            if resource is not None:
+                entry["resource"] = resource
+            entry["request"] = {"method": method, "url": rtype if method == "POST" else f"{rtype}/{rid}"}
+            entry["response"] = {"status": f"{status} {REASONS.get(status, '')}".strip(), "etag": f'W/"{version}"',
+                                 "lastModified": updated}
+            entries.append(entry)
+
+        def link(relation, start):
+            q = [f"_count={size}"] + ([f"_since={quote(controls['_since'], safe=':')}"] if since is not None else [])
+            q += [f"_offset={start}"] if start else []
+            return {"relation": relation, "url": f"{self.base}/{rtype}/{rid}/_history?" + "&".join(q)}
+
+        links = [link("self", offset)]
+        if size and offset + size < len(items):
+            links.append(link("next", offset + size))
+        if offset > 0:
+            links.append(link("previous", max(0, offset - size)))
+        bundle = {"resourceType": "Bundle", "id": str(uuid.uuid4()),
+                  "meta": {"lastUpdated": datetime.now(timezone.utc).isoformat(timespec="milliseconds")},
+                  "type": "history", "total": len(items), "link": links}
+        if entries:
+            bundle["entry"] = entries
+        return bundle
 
     def page(self, pairs, handling):
         try:
@@ -801,7 +1024,9 @@ class Engine:
                 if name == "_id":
                     expr = "r.id"
                 elif name == "_lastUpdated":
-                    continue
+                    if not self.has_written:     # all equal: the load instant
+                        continue
+                    expr = f"COALESCE((SELECT w.low FROM written w WHERE w.pid = r.pid), {self.last_updated[0]})"
                 else:
                     p = self.param(rtype, name)
                     column = SORT_COLUMN.get(p["ptype"])
@@ -875,11 +1100,23 @@ class Engine:
         if modifier:
             raise SearchError(400, f"Unsupported modifier :{modifier} for _lastUpdated")
         t_low, t_high = self.last_updated
-        ok = False
+        ok, clauses, args = False, [], []
         for v in split_or(value):
             prefix, low, high = self._date_bounds(v)
-            ok = ok or _date_eval(prefix, t_low, t_high, low, high, self._approx(low, high))
-        return Crit("1" if ok else "0")
+            approx = self._approx(low, high)
+            ok = ok or _date_eval(prefix, t_low, t_high, low, high, approx)
+            sql, a = _date_sql(prefix, "w.low", "w.high", low, high, approx)
+            clauses.append(sql)
+            args += a
+        if not self.has_written:                 # every resource carries the load instant
+            return Crit("1" if ok else "0")
+        # Written resources have their own lastUpdated (table `written`); loaded ones the load instant.
+        w, where = self.alias("w"), " OR ".join(clauses)
+        where_w = re.sub(r"\bw\.", f"{w}.", where)
+        written = f"EXISTS (SELECT 1 FROM written {w} WHERE {w}.pid = {{a}}.pid AND ({where_w}))"
+        if not ok:
+            return Crit(written, args, f"SELECT {w}.pid FROM written {w} WHERE ({where_w})", args, RANK["date"])
+        return Crit(f"({written} OR NOT EXISTS (SELECT 1 FROM written {w}x WHERE {w}x.pid = {{a}}.pid))", args)
 
     def _date_bounds(self, value):
         prefix, text = split_prefix(value)
@@ -891,8 +1128,13 @@ class Engine:
 
     def _approx(self, low, high):
         """ap window: the value range widened by 10% of its distance from the store's 'now'
-        (its load instant, so answers do not drift with wall-clock time)."""
-        now = self.last_updated[0]
+        (its load instant, so answers do not drift with wall-clock time). A store opened for writing
+        uses the current time, from the writer's clock when this connection writes."""
+        if self.settings.get("writable"):
+            clock = self.writer.clock() if self.writer else datetime.now(timezone.utc)
+            now = date_range(clock.astimezone(timezone.utc).isoformat(timespec="microseconds"), self.tz)[0]
+        else:
+            now = self.last_updated[0]
         gap = abs((low + high) // 2 - now) // 10
         return low - gap, high + gap
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import socket
 import tarfile
 import tempfile
@@ -190,18 +191,78 @@ def run_cases(definitions_path, output=None):
             coverage[key]["cases"] += 1
             coverage[key]["passed"] += passed
     server.shutdown()
+    writes = run_write_cases(db, definitions_path, work, http_get)
     uncovered = [k for k in DECLARED if coverage[k]["passed"] == 0]
     undeclared = sorted(k for k in coverage if k not in DECLARED)
     failed = [r for r in results if not r["passed"]]
     report = {"cases": len(results), "passed": len(results) - len(failed), "failed": len(failed),
               "declared_combinations": len(DECLARED), "combinations_with_passing_case": len(DECLARED) - len(uncovered),
               "uncovered_or_failing_combinations": uncovered, "undeclared_keys": undeclared,
-              "failures": failed, "coverage": {k: coverage[k] for k in DECLARED}}
+              "failures": failed, "coverage": {k: coverage[k] for k in DECLARED}, **writes}
     if output:
         Path(output).write_text(json.dumps(report, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({k: report[k] for k in ("cases", "passed", "failed", "declared_combinations",
                                              "combinations_with_passing_case", "uncovered_or_failing_combinations",
-                                             "undeclared_keys")}, ensure_ascii=False))
+                                             "undeclared_keys", "write_steps", "write_failed")}, ensure_ascii=False))
+    print(json.dumps({"equivalence": {k: "ok" if not v else v for k, v in report["equivalence"].items()}},
+                     ensure_ascii=False))
+    for r in report["write_failures"]:
+        print(f"FAIL write {r['id']} ({r['mode']}): {json.dumps(r['problems'], ensure_ascii=False)[:400]}")
     for r in failed:
         print(f"FAIL {r['id']}: {json.dumps(r['problems'], ensure_ascii=False)[:400]}")
     return report
+
+
+def run_write_cases(fixture_db, definitions_path, work, http_get):
+    """The write steps on two writable copies of the fixture (in process and over HTTP), and the
+    load-versus-write equivalence checks."""
+    from .writecases import STEPS, Clock, equivalence, run_steps
+    package = [work / "fixture-package.tgz"]
+    failures = []
+
+    local_db = work / "write-local.sqlite"
+    shutil.copy(fixture_db, local_db)
+    clock = Clock("2026-02-01T00:00:00+00:00")
+    with Engine(local_db, writable=True, definitions=definitions_path, packages=package, clock=clock) as engine:
+        def local(method, path, body, headers, at):
+            clock.set(at)
+            content = headers.get("Content-Type", "application/fhir+json")
+            data = body if body is None or isinstance(body, dict) else body.encode("utf-8")
+            if method == "GET":
+                status, answer = engine.get(path)
+            elif method == "POST":
+                status, answer = engine.post(path, data, content)
+            elif method == "PUT":
+                status, answer = engine.put(path, data, content, headers.get("If-Match"))
+            elif method == "DELETE":
+                status, answer = engine.delete(path, headers.get("If-Match"))
+            else:
+                status, answer = 405, None
+            return status, answer, {}, lambda url: engine.get(url[len(engine.base):])
+        failures += [{**r, "mode": "in_process"} for r in run_steps(local_db, definitions_path, package, local, False)
+                     if not r["passed"]]
+
+    http_db = work / "write-http.sqlite"
+    shutil.copy(fixture_db, http_db)
+    http_clock = Clock("2026-02-01T00:00:00+00:00")
+    server, base = serve(http_db, port=0, writable=True, definitions=definitions_path, packages=package, clock=http_clock)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def fetch(url):
+        status, _, raw = http_get(url)
+        return status, json.loads(raw) if raw else {}
+
+    def remote(method, path, body, headers, at):
+        http_clock.set(at)
+        data = json.dumps(body) if isinstance(body, dict) else body
+        sent = {"Content-Type": "application/fhir+json", **headers} if data is not None else dict(headers)
+        status, answer_headers, raw = http_get(f"{base}/{path}", method, sent, data)
+        return status, json.loads(raw) if raw else {}, answer_headers, fetch
+    failures += [{**r, "mode": "http"} for r in run_steps(http_db, definitions_path, package, remote, True)
+                 if not r["passed"]]
+    server.shutdown()
+    server.engine.close()
+
+    checks = equivalence(fixture_db, definitions_path, package, work)
+    return {"write_steps": len(STEPS), "write_failed": len(failures), "write_failures": failures,
+            "equivalence": checks}
