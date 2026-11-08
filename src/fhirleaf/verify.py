@@ -24,7 +24,7 @@ from .extract import contained_resources, Extractor
 from .search import CONTROL, Engine, _date_eval, _distance_km, parse_text_query, text_match
 from .inputs import conditional_key, input_files, read_file, resolve_conditional
 from .store import Definitions, _narrative, _text_leaves, load
-from .values import soundex, normalize, number_bounds, resolve_timezone, split_escaped, split_or, split_prefix, unescape
+from .values import phonetic_codes, normalize, number_bounds, resolve_timezone, split_escaped, split_or, split_prefix, unescape
 
 TERM = re.compile(r"[^\W_]+")
 
@@ -352,7 +352,8 @@ class Oracle:
             return any(_date_eval(b[0], lo, hi, b[1], b[2], self.e._approx(b[1], b[2]))
                        for v in values for b in [self.e._date_bounds(v)] for lo, hi in self.rows(pid, "date", p))
         if p["ptype"] == "string" and p.get("usage") == "phonetic":
-            return any(soundex(unescape(v)) == norm for v in values for norm, _ in self.rows(pid, "string", p))
+            have = {norm for norm, _ in self.rows(pid, "string", p)}
+            return any(set(phonetic_codes(unescape(v))) <= have for v in values)
         if p["ptype"] == "string":
             out = False
             for v in values:

@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 
 from .fhirpath import ENV, QUANTITY_PROFILES, UnsupportedPath, compile_expression
-from .values import HIGH_OPEN, LOW_OPEN, date_range, normalize, soundex
+from .values import HIGH_OPEN, LOW_OPEN, date_range, normalize, phonetic_codes
 
 INF = float("inf")
 
@@ -263,13 +263,11 @@ class Extractor:
                 for low, high in date_values(node, tz):
                     out["date"].add((pid_, low, high, pid))
         elif ptype == "string" and p.get("usage") == "phonetic":
-            # phonetic: one row per name word, norm = its Soundex code
+            # phonetic: one row per name part, norm = its phonetic code (letters Soundex, digits exact)
             for node in nodes:
                 for s in string_values(node):
-                    for word in s.split():
-                        code = soundex(word)
-                        if code:
-                            out["string"].add((pid_, code, word, pid))
+                    for code in phonetic_codes(s):
+                        out["string"].add((pid_, code, s, pid))
         elif ptype == "string":
             family_param = (p.get("expression") or "").rstrip().endswith(".family")
             for node in nodes:

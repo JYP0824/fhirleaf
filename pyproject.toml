@@ -1,6 +1,6 @@
 [project]
 name = "fhirleaf"
-version = "0.1.4"
+version = "0.1.5"
 description = "FHIRLeaf: A local FHIR R4 RESTful search engine over a single SQLite file (no server, standard library only)"
 readme = "README.md"
 license = "Apache-2.0"

@@ -167,6 +167,20 @@ def soundex(text):
     return ("".join(out) + "000")[:4]
 
 
+PHONETIC_PART = re.compile(r"[^\W\d_]+|\d+")
+
+
+def phonetic_codes(text):
+    """Phonetic index codes of a name: each run of letters as its American Soundex code, each run
+    of digits as itself ('#123'), so 'Patient_123' is ['P355', '#123'] and 'Smyth' is ['S530']."""
+    codes = []
+    for part in PHONETIC_PART.findall(text):
+        code = "#" + part if part.isdigit() else soundex(part)
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
 def split_escaped(value, separator):
     """Split on unescaped `separator`; `\\,` `\\|` `\\$` `\\\\` are literal."""
     parts, current, i = [], [], 0

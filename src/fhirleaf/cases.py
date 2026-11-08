@@ -61,6 +61,8 @@ FIXTURE = [
      "occurrenceTiming": {"event": ["2013-01-31", "2013-03-24"]}},
     {"resourceType": "Group", "id": "loc2", "type": "person", "actual": True},
     {"resourceType": "ValueSet", "id": "vs1", "url": "http://example.org/vs/1", "version": "2.0", "status": "active"},
+    {"resourceType": "Practitioner", "id": "pr2", "name": [{"family": "Patient_123"}]},
+    {"resourceType": "Practitioner", "id": "pr3", "name": [{"family": "Patient_456"}]},
     {"resourceType": "Practitioner", "id": "pr1", "name": [{"family": "Carreno Quinones", "given": ["Jose-Maria"]},
                                                        {"family": "O'Brien"}]},
     {"resourceType": "List", "id": "list1", "status": "current", "mode": "working",
@@ -183,7 +185,12 @@ case("phonetic", "string:phonetic", "Patient?phonetic=Mueller", match=Pt("p1", "
 case("phonetic-accent", "string:phonetic", "Patient?phonetic=M%C3%BCler", match=Pt("p1", "p2"))
 case("phonetic-no-match", "string:phonetic", "Patient?phonetic=Anderson", match=[])
 error("err-phonetic-modifier", "reject:bad-modifier", "Patient?phonetic:exact=Mueller", 400)
-error("err-phonetic-no-letters", "reject:bad-value", "Patient?phonetic=123", 400)
+error("err-phonetic-no-letters", "reject:bad-value", "Patient?phonetic=%20-%20", 400)
+case("phonetic-digits", "string:phonetic", "Practitioner?phonetic=Patient_123", match=["Practitioner/pr2"])
+case("phonetic-digits-sound", "string:phonetic", "Practitioner?phonetic=Patyent_123", match=["Practitioner/pr2"])
+case("phonetic-letters-only", "string:phonetic", "Practitioner?phonetic=Patient", match=["Practitioner/pr2", "Practitioner/pr3"])
+case("phonetic-or", "string:phonetic", "Practitioner?phonetic=Patient_123,Patient_456",
+     match=["Practitioner/pr2", "Practitioner/pr3"])
 case("composite-and-repeat", "composite:token$quantity common:and",
      "Observation?code-value-quantity=http://loinc.org|8867-4$gt75&code-value-quantity=http://loinc.org|8867-4$lt85",
      match=O("o2"))

@@ -12,7 +12,7 @@ It loads FHIR data into one SQLite file and searches it on your machine, with no
 ## Quick start
 
 ```bash
-uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.4"
+uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.5"
 curl -fL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
 fhirleaf verify --cases --definitions definitions-r4.json.zip
 fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store.db
@@ -24,11 +24,11 @@ fhirleaf serve --db store.db --port 8080
 
 | Source | Command |
 |---|---|
-| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.4"` |
+| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.1.5"` |
 | PyPI (after release) | `uv add fhirleaf` |
-| Wheel | `uv add ./fhirleaf-0.1.4-py3-none-any.whl` |
+| Wheel | `uv add ./fhirleaf-0.1.5-py3-none-any.whl` |
 | Local checkout | `uv add --editable ./fhirleaf` |
-| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.4"` |
+| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.1.5"` |
 
 `pip install` takes the same sources.
 
@@ -98,7 +98,7 @@ Empty parameters are ignored in both modes.
 
 | Command | What it checks | Result |
 |---|---|---|
-| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP | 302/302 cases, 157/157 combinations |
+| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP | 306/306 cases, 157/157 combinations |
 | `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching, with per-parameter coverage | MIMIC-IV-on-FHIR Demo 1,240/1,240, Synthea + US Core 2,431/2,431 |
 | `fhirleaf support --definitions D --output FILE` | Status of every SearchParameter per resource type | R4: 2,873 of 3,026 supported |
 
@@ -125,6 +125,7 @@ fhirleaf compare --db store.db --recorded recorded.jsonl --report report.json
 | `POST [base]/_search`, `[type]/_search`, `[compartment]/[id]/[type]/_search` | Search with a form-encoded body |
 | `HEAD` | Headers only |
 | Other methods | `405` with `Allow: GET, HEAD` |
+| Resource type without loaded data | `404` (not listed in `metadata`) |
 | History, operations (`$...`) | `400` |
 
 Responses use the requested JSON type: `application/fhir+json` (default), `application/json`,
@@ -156,6 +157,8 @@ Common parameters: `_id`, `_lastUpdated`, `_list`, `_content`, `_text` (with `--
 | Timing | Matched by its outer limits (events and `repeat.boundsPeriod`). |
 | Plain id on a reference with several target types | `400` when the id exists in more than one of them. Use `Type/id`. |
 | Unknown `_list` | Empty result |
+| `:not-in` | Also matches resources without a value for the parameter, like `:not` |
+| `_include`, `_revinclude` | Every included resource is returned. There is no cap. |
 | `_text`, `_content` | Words (all required), `"phrases"`, `AND`, `OR`, `NOT`, parentheses. Commas are OR. |
 
 ### Result parameters
@@ -175,7 +178,7 @@ The `self` link carries the parameters actually used, and on later pages it is t
 | Order without `_sort` | Load order |
 | Missing sort values | Last |
 | `near` without a distance | 1 km |
-| Phonetic matching | American Soundex |
+| Phonetic matching | Letters by American Soundex, digits exactly. Every part of the value must match. |
 | `ap` reference point | Load instant (`--last-updated`), not the current time |
 | Sort on token, reference | By code, by target id |
 

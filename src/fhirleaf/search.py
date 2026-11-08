@@ -14,7 +14,8 @@ from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from .store import VERSION as STORE_VERSION
-from .values import (date_range, normalize, number_bounds, resolve_timezone, soundex, split_escaped, split_or, split_prefix,
+from .values import (date_range, normalize, number_bounds, phonetic_codes, resolve_timezone, split_escaped, split_or,
+                     split_prefix,
                      unescape)
 
 CONTROL = frozenset({"_count", "_sort", "_include", "_revinclude", "_summary", "_elements", "_total", "_format",
@@ -1120,10 +1121,24 @@ class Engine:
         if p.get("usage") == "phonetic":
             if modifier:
                 raise SearchError(400, f"Unsupported modifier :{modifier} for phonetic parameter {p['code']}")
-            codes = [soundex(unescape(v)) for v in split_or(value)]
-            if not all(codes):
-                raise SearchError(400, f'Phonetic search value "{value}" has no letters')
-            return self._exists("sp_string", p, " OR ".join("t.norm = ?" for _ in codes), codes, RANK["string"])
+            # every part of a value (letters by Soundex, digits exactly) must match; values are OR
+            alternatives = [phonetic_codes(unescape(v)) for v in split_or(value)]
+            if not all(alternatives):
+                raise SearchError(400, f'Phonetic search value "{value}" has no letters or digits')
+            conds, drivers, args = [], [], []
+            for codes in alternatives:
+                parts = []
+                for code in codes:
+                    t = self.alias()
+                    parts.append(f"EXISTS (SELECT 1 FROM sp_string {t} WHERE {t}.pid = {{a}}.pid AND "
+                                 f"{t}.param = {p['id']} AND {t}.norm = ?)")
+                    args.append(code)
+                conds.append("(" + " AND ".join(parts) + ")")
+                drivers.append(" INTERSECT ".join(f"SELECT pid FROM sp_string WHERE param = {p['id']} AND norm = ?"
+                                                  for _ in codes))
+            driver_args = [c for codes in alternatives for c in codes]
+            return Crit("(" + " OR ".join(conds) + ")", args,
+                        " UNION ".join(f"SELECT * FROM ({d})" for d in drivers), driver_args, RANK["string"])
         if modifier not in (None, "exact", "contains"):
             raise SearchError(400, f"Unsupported modifier :{modifier} for string parameter {p['code']}")
         clauses, args = [], []

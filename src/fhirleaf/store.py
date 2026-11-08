@@ -26,7 +26,7 @@ from .fhirpath import Model
 from .inputs import conditional_key, conditional_references, input_files, package_resources, read_file, resolve_conditional
 from .values import resolve_timezone
 
-VERSION = "fhirleaf-store-v2"
+VERSION = "fhirleaf-store-v3"
 SCHEMA = """
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE strings(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);
