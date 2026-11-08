@@ -512,7 +512,7 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
     db.commit()
     db.close()
     os.replace(staging, output)
-    print(json.dumps({"output": str(output), "resources": pid, "counts": counts, "duplicates_skipped": duplicates,
+    print(json.dumps({"output": str(output), "resources": sum(counts.values()), "counts": counts, "duplicates_skipped": duplicates,
                       "unresolved_conditional_references": len(unresolved), "seconds": round(time.time() - started),
                       "unsupported_expressions": extractor.unsupported}), flush=True)
     return output

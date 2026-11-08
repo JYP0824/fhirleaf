@@ -253,7 +253,16 @@ def _entries(bundle):
              e.get("search", {}).get("mode")) for e in bundle.get("entry", [])]
 
 
-def compare(db_path, recorded_dir, report_path, *, examples=15):
+def compare(db_path, recorded_dir, report_path, *, examples=15, max_pages=10000):
+    """Compare the store with another server's recorded responses by meaning, not by page layout:
+    the matches over all pages as a set (as a sequence when the request has _sort), included
+    resources as a set, total only when both servers give one, and resource bodies without
+    server-assigned meta. Page sizes and link relations are server choices and are not compared.
+
+    Categories: match; membership / order / include / total / content / extra_elements (differences
+    to adjudicate against the specification); engine_rejects (the reference answered, the store
+    returned an error); reference_rejects (the reference returned an error, the store answered);
+    reference_incomplete (the recording stops before the last page: only checked for a subset)."""
     lines = (Path(recorded_dir) / "responses.jsonl").read_text(encoding="utf-8").splitlines()
     engines = {}
     counts, kinds, samples = Counter(), defaultdict(Counter), defaultdict(list)
@@ -262,16 +271,7 @@ def compare(db_path, recorded_dir, report_path, *, examples=15):
         base = item["base"]
         engine = engines.get(base) or engines.setdefault(base, Engine(db_path, base_url=base))
         path = "/" + item["request"].lstrip("/")
-        problems = []
-        for i, expected in enumerate(item["pages"]):
-            status, body = engine.get(path)
-            problems += _diff(i, expected["status"], expected["body"], status, body)
-            nxt = [l["url"] for l in body.get("link", []) if l.get("relation") == "next"] if status == 200 else []
-            if not nxt:
-                if i + 1 < len(item["pages"]):
-                    problems.append(("paging", f"page {i}: engine has no next link, reference has {len(item['pages'])} pages"))
-                break
-            path = nxt[0][len(base):] if nxt[0].startswith(base) else nxt[0]
+        problems = _compare_item(engine, base, path, item["request"], item["pages"], max_pages)
         categories = sorted({p[0] for p in problems}) or ["match"]
         for c in categories:
             counts[c] += 1
@@ -286,34 +286,79 @@ def compare(db_path, recorded_dir, report_path, *, examples=15):
     return report
 
 
-def _diff(i, ref_status, ref, status, got):
+def _engine_pages(engine, base, path, max_pages):
+    pages = []
+    while path and len(pages) < max_pages:
+        status, body = engine.get(path)
+        pages.append({"status": status, "body": body})
+        nxt = [l["url"] for l in body.get("link", []) if l.get("relation") == "next"] if status == 200 else []
+        path = (nxt[0][len(base):] if nxt[0].startswith(base) else nxt[0]) if nxt else None
+    return pages
+
+
+def _collect(pages):
+    """(matches in order, included set, total of the first page, bodies by key)."""
+    matches, included, bodies = [], set(), {}
+    for page in pages:
+        for e in page["body"].get("entry", []):
+            r = e.get("resource", {})
+            key = f"{r.get('resourceType', '')}/{r.get('id', '')}"
+            mode = e.get("search", {}).get("mode")
+            if mode == "match":
+                matches.append(key)
+                bodies.setdefault(key, r)
+            elif mode == "include":
+                included.add(key)
+    return matches, included, pages[0]["body"].get("total"), bodies
+
+
+def _compare_item(engine, base, path, request, ref_pages, max_pages):
+    ref_status, ref = ref_pages[0]["status"], ref_pages[0]["body"]
+    mine_pages = _engine_pages(engine, base, path, max_pages)
+    status, got = mine_pages[0]["status"], mine_pages[0]["body"]
     if ref_status != status:
-        return [("status", f"page {i}: reference {ref_status}, engine {status}: "
-                           f"{json.dumps(got.get('issue', ''))[:200]} | ref {json.dumps(ref.get('issue', ''))[:200]}")]
-    if ref.get("resourceType") == "OperationOutcome":
-        return []           # same status; error texts are implementation-specific
+        if status != 200:
+            return [("engine_rejects", f"reference {ref_status}, engine {status}: {json.dumps(got.get('issue', ''))[:200]}")]
+        if ref_status != 200:
+            return [("reference_rejects", f"reference {ref_status}: {json.dumps(ref.get('issue', ''))[:200]}")]
+    if ref.get("resourceType") == "OperationOutcome" or got.get("resourceType") == "OperationOutcome":
+        return []                     # both errors; error texts are implementation-specific
     if ref.get("resourceType") != "Bundle":
-        return [] if _strip(ref) == _strip(got) else [("content", f"page {i}: non-Bundle response differs")]
+        return [] if _strip(ref) == _strip(got) else _body_diff(request, ref, got)
     out = []
-    if ("total" in ref) != ("total" in got) or ref.get("total") != got.get("total"):
-        out.append(("total", f"page {i}: reference total {ref.get('total')}, engine {got.get('total')}"))
-    a, b = _entries(ref), _entries(got)
-    if a != b:
-        if sorted(a) == sorted(b):
-            out.append(("order", f"page {i}: same entries, different order"))
-        else:
-            missing, extra = sorted(set(a) - set(b))[:3], sorted(set(b) - set(a))[:3]
-            out.append(("membership", f"page {i}: {len(a)} vs {len(b)}; missing {missing} extra {extra}"))
-    else:
-        for x, y in zip(ref.get("entry", []), got.get("entry", [])):
-            if _strip(x.get("resource")) != _strip(y.get("resource")):
-                out.append(("content", f"page {i}: {x.get('fullUrl')} resource body differs"))
-                break
-            if x.get("fullUrl") != y.get("fullUrl"):
-                out.append(("full_url", f"page {i}: {x.get('fullUrl')} vs {y.get('fullUrl')}"))
-                break
-    ra = sorted(l.get("relation") for l in ref.get("link", []))
-    rb = sorted(l.get("relation") for l in got.get("link", []))
-    if ra != rb:
-        out.append(("links", f"page {i}: reference {ra}, engine {rb}"))
+    complete = not any(l.get("relation") == "next" for l in ref_pages[-1]["body"].get("link", []))
+    a, a_inc, a_total, a_bodies = _collect(ref_pages)
+    b, b_inc, b_total, b_bodies = _collect(mine_pages)
+    if a_total is not None and b_total is not None and a_total != b_total:
+        out.append(("total", f"reference total {a_total}, engine {b_total}"))
+    if not complete:
+        missing = sorted(set(a) - set(b))
+        out.append(("reference_incomplete", f"recorded {len(a)} matches over {len(ref_pages)} pages, engine {len(b)}"))
+        if missing:
+            out.append(("membership", f"recorded matches the engine lacks: {missing[:3]}"))
+    elif set(a) != set(b):
+        out.append(("membership", f"{len(a)} vs {len(b)}; missing {sorted(set(a) - set(b))[:3]} "
+                                  f"extra {sorted(set(b) - set(a))[:3]}"))
+    elif "_sort=" in request and a != b:
+        first = next(i for i, (x, y) in enumerate(zip(a, b)) if x != y)
+        out.append(("order", f"same matches, order differs from position {first}"))
+    # includes are per page: a resource that is a match on another page may be an include here
+    a_inc, b_inc = a_inc - set(a), b_inc - set(b)
+    if complete and not any(c in ("membership", "order") for c, _ in out) and a_inc != b_inc:
+        out.append(("include", f"includes {len(a_inc)} vs {len(b_inc)}; missing {sorted(a_inc - b_inc)[:3]} "
+                               f"extra {sorted(b_inc - a_inc)[:3]}"))
+    for key in sorted(set(a_bodies) & set(b_bodies)):
+        diff = _body_diff(key, a_bodies[key], b_bodies[key])
+        if diff:
+            out += diff
+            break
     return out
+
+
+def _body_diff(label, ref, got):
+    x, y = _strip(ref), _strip(got)
+    if x == y:
+        return []
+    if isinstance(x, dict) and isinstance(y, dict) and set(x) < set(y) and all(x[k] == y[k] for k in x):
+        return [("extra_elements", f"{label}: engine also returns {sorted(set(y) - set(x))}")]
+    return [("content", f"{label}: resource body differs")]
