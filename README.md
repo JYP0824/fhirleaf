@@ -134,12 +134,11 @@ Empty parameters are ignored in both modes.
 
 ## Check
 
-| Command | What it checks | Result |
-|---|---|---|
-| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP. CI runs them on Python 3.10, 3.12 and 3.13. | 306/306 cases, 157/157 combinations |
-| (same command) | Write steps worked out from R4 http.html, run in process and over HTTP. Stores filled by writes against fresh loads, a failed write rolled back, and concurrent If-Match updates | 61/61 steps, 4/4 checks |
-| `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching, with per-parameter coverage | MIMIC-IV-on-FHIR Demo 1,240/1,240, Synthea + US Core 2,431/2,431 |
-| `fhirleaf support --definitions D --output FILE` | Status of every SearchParameter per resource type | R4: 2,873 of 3,026 supported |
+| Command | What it checks |
+|---|---|
+| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP. Write steps worked out from R4 http.html. Stores filled by writes against fresh loads, a failed write rolled back, and concurrent If-Match updates. CI runs them on Python 3.10, 3.12 and 3.13. |
+| `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching, with per-parameter coverage |
+| `fhirleaf support --definitions D --output FILE` | Status of every SearchParameter per resource type |
 
 Compare with another FHIR server:
 
