@@ -18,12 +18,15 @@ import sqlite3
 import time
 import zipfile
 import zlib
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .extract import contained_resources, TABLES, Extractor
 from .fhirpath import Model
-from .inputs import conditional_key, conditional_references, input_files, package_resources, read_file, resolve_conditional
+from .inputs import (conditional_key, conditional_references, input_files, package_resources, read_file, read_lines,
+                     resolve_conditional, unpack)
 from .values import resolve_timezone
 
 VERSION = "fhirleaf-store-v3"
@@ -310,7 +313,7 @@ def capability(params, supported, settings, definitions, compartments):
     note = (f"fhirleaf embedded FHIR RESTful Search. Date/time search values without an offset are read in zone "
             f"{settings['timezone']}; default page size {settings['default_count']}, maximum {settings['max_count']}; "
             f"results without _sort are in stable store order; near without a distance uses "
-            f"{settings['near_default_km']} km; phonetic parameters match by American Soundex of a name word; "
+            f"{settings['near_default_km']} km; phonetic parameters match name parts, letters by American Soundex and digits exactly; "
             f"token codes and identifier values compare case-insensitively (ASCII); date 'ap' is 10% of the distance "
             f"from the load instant {settings['last_updated']}.")
     return {"resourceType": "CapabilityStatement", "status": "active", "kind": "instance",
@@ -340,8 +343,10 @@ def _narrative(resource):
 
 
 def load(inputs, definitions_path, output, *, packages=(), settings=None, fulltext=False, hash_sources=True,
-         batch=20000):
-    """inputs: files or directories of *.ndjson[.gz] / *.json[.gz] (Bundles or single resources)."""
+         batch=5000, workers=1):
+    """inputs: files or directories of *.ndjson[.gz] / *.json[.gz] (Bundles or single resources).
+    workers > 1 parses and extracts batches in that many processes. The store is the same for any
+    number of workers: batches are written in input order by this process."""
     output = Path(output)
     if output.exists():
         raise ValueError(f"Output exists; use a fresh path: {output}")
@@ -366,18 +371,21 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
             sid = strings[value] = len(strings) + 1
         return sid
 
-    params = []
-    extractor = Extractor(definitions.model, [], intern, tz, config["local_bases"])
+    # Parameter ids are fixed per definitions (every resource type, in order), so every worker
+    # writes the same ids. Only the types that occur are registered in the store.
+    preassigned = preassigned_params(definitions)
+    params, withdrawn = [], set()
+    registry = Extractor(definitions.model, [], intern, tz, config["local_bases"])
 
     def register(rtype):
-        new = definitions.params_for([rtype])
-        for p in new:
-            p["id"] = len(params) + 1
+        if rtype not in preassigned:
+            raise ValueError(f"Resource type {rtype} is not defined in the loaded FHIR definitions")
+        for p in preassigned[rtype]:
             params.append(p)
             db.execute("INSERT INTO params VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
                 p["id"], p["type"], p["code"], p["ptype"], p["url"], p.get("expression"), json.dumps(p["targets"]),
                 json.dumps(p["components"]), p["usage"], _flag(p["multiple_or"]), _flag(p["multiple_and"])))
-        extractor.add(new)
+        registry.add(preassigned[rtype])
 
     # Conditional references (Type?identifier=system|value) in Bundle inputs resolve against
     # the identifiers of every Bundle/JSON input resource; bulk NDJSON references are literal.
@@ -404,72 +412,97 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
                                 keys.setdefault(key, set()).add(f"{r['resourceType']}/{r['id']}")
         conditional = {ref: next(iter(keys[ref])) for ref in wanted if len(keys.get(ref, ())) == 1}
     meta_patch = {"versionId": "1", "lastUpdated": config["last_updated"]}
-    pending = {t: [] for t in TABLES}
-    resource_rows, fts_rows, seen, counts, pid = [], [], {}, {}, 0
-    duplicates, unresolved, contained_count = 0, set(), 0
+    json_set = set(json_inputs)
+    counts, per_file, unresolved = {}, {}, set()
+    pid, duplicates, contained_count, reported = 0, 0, 0, 0
     started = time.time()
 
-    def flush():
-        db.executemany("INSERT INTO resources VALUES (?,?,?,?,?)", resource_rows)
-        resource_rows.clear()
-        for table, rows in pending.items():
-            if rows:
-                db.executemany(INSERT[table], rows)
-                rows.clear()
-        if fts_rows:
-            db.executemany("INSERT INTO fts(rowid, content, narrative) VALUES (?,?,?)", fts_rows)
-            fts_rows.clear()
+    def batches():
+        """(file, items): raw NDJSON lines, or resources of Bundle/JSON inputs after duplicate checks."""
+        seen = {}
+        for path in files:
+            items = []
+            if path in json_set:
+                for resource in read_file(path):
+                    rtype = resource.get("resourceType")
+                    if not rtype or not resource.get("id"):
+                        raise ValueError(f"Resource without resourceType/id in {path.name}")
+                    resolve_conditional(resource, conditional)
+                    resource["meta"] = {**resource.get("meta", {}), **meta_patch}
+                    text = json.dumps(resource, ensure_ascii=False, separators=(",", ":"))
+                    key, crc = (rtype, resource["id"]), zlib.crc32(text.encode("utf-8"))
+                    if key in seen:
+                        if seen[key] != crc:
+                            raise ValueError(f"Conflicting duplicate resource {rtype}/{resource['id']} in {path.name}")
+                        nonlocal_duplicates[0] += 1
+                        continue
+                    seen[key] = crc
+                    items.append(resource)
+                    if len(items) >= batch:
+                        yield path, items
+                        items = []
+            else:
+                for line in read_lines(path):
+                    items.append(line)
+                    if len(items) >= batch:
+                        yield path, items
+                        items = []
+            if items:
+                yield path, items
 
-    sources, json_set = [], set(json_inputs)
-    for path in files:
-        n = 0
-        track = path in json_set
-        for resource in read_file(path):
-            rtype = resource.get("resourceType")
-            if not rtype or not resource.get("id"):
-                raise ValueError(f"Resource without resourceType/id in {path.name}")
-            unresolved |= resolve_conditional(resource, conditional)
-            resource["meta"] = {**resource.get("meta", {}), **meta_patch}
-            text = json.dumps(resource, ensure_ascii=False, separators=(",", ":"))
-            if track:
-                key, crc = (rtype, resource["id"]), zlib.crc32(text.encode("utf-8"))
-                if key in seen:
-                    if seen[key] != crc:
-                        raise ValueError(f"Conflicting duplicate resource {rtype}/{resource['id']} in {path.name}")
-                    duplicates += 1
-                    continue
-                seen[key] = crc
-            if rtype not in counts:
-                register(rtype)
-                counts[rtype] = 0
-            pid += 1
-            n += 1
-            counts[rtype] += 1
-            resource_rows.append((pid, intern(rtype), resource["id"], zlib.compress(text.encode("utf-8"), 6), None))
-            local, contained = contained_resources(resource)
-            for table, rows in extractor.rows(resource, pid, local).items():
-                pending[table].extend(rows)
-            container = pid
-            if fulltext:
-                fts_rows.append((container, " ".join(_text_leaves(resource, [])), _narrative(resource)))
-            for row_id, item, inner in contained:
-                ctype = item["resourceType"]
-                if ctype not in counts:
-                    register(ctype)
-                    counts[ctype] = 0
-                pid += 1
-                contained_count += 1
-                ctext = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-                resource_rows.append((pid, intern(ctype), row_id, zlib.compress(ctext.encode("utf-8"), 6), container))
-                for table, rows in extractor.rows(item, pid, inner).items():
-                    pending[table].extend(rows)
-            if len(resource_rows) >= batch:
-                flush()
-            if pid % 200000 == 0:
+    nonlocal_duplicates = [0]
+    if workers > 1:
+        pool = ProcessPoolExecutor(workers, initializer=_init_worker,
+                                   initargs=(str(definitions_path), list(packages), config["timezone"],
+                                             config["local_bases"], conditional, meta_patch, fulltext))
+        results = _ordered(pool, batches(), workers * 3)
+    else:
+        pool = None
+        _setup(definitions, tz, config["local_bases"], conditional, meta_patch, fulltext)
+        results = ((path, _process(items, path.name)) for path, items in batches())
+    try:
+        for path, res in results:
+            for rtype, n in res["counts"].items():
+                if rtype not in counts:
+                    register(rtype)
+                    counts[rtype] = 0
+                counts[rtype] += n
+            for rtype, code, why in res["withdrawn"]:
+                if (rtype, code) not in withdrawn:
+                    withdrawn.add((rtype, code))
+                    registry.by_type[rtype] = [e for e in registry.by_type[rtype] if e[0]["code"] != code]
+                    registry.unsupported.append((rtype, code, why))
+            base = pid
+            db.executemany("INSERT INTO resources VALUES (?,?,?,?,?)",
+                           ((base + lp, intern(t), rid, blob, None if c is None else base + c)
+                            for lp, t, rid, blob, c in res["resources"]))
+            for table, rows in res["rows"].items():
+                if rows:
+                    cols = INTERNED.get(table)
+                    db.executemany(INSERT[table], (_remap(r, cols, base, intern) for r in rows) if cols
+                                   else ((*r[:-1], r[-1] + base) for r in rows))
+            if res["fts"]:
+                db.executemany("INSERT INTO fts(rowid, content, narrative) VALUES (?,?,?)",
+                               ((base + c, a, b) for c, a, b in res["fts"]))
+            pid += res["n"]
+            contained_count += res["contained"]
+            unresolved.update(res["unresolved"])
+            per_file[path] = per_file.get(path, 0) + res["top"]
+            if pid // 200000 > reported:
+                reported = pid // 200000
                 print(f"loaded {pid} resources ({time.time() - started:.0f}s)", flush=True)
-        sources.append({"file": str(path.name), "resources": n, "bytes": path.stat().st_size,
-                        "sha256": file_sha256(path) if hash_sources else None})
-    flush()
+    finally:
+        if pool is not None:
+            pool.shutdown(cancel_futures=True)
+    duplicates += nonlocal_duplicates[0]
+    sources = [{"file": str(path.name), "resources": per_file.get(path, 0), "bytes": path.stat().st_size,
+                "sha256": file_sha256(path) if hash_sources else None} for path in files]
+    # Rows of a parameter withdrawn during extraction (it needs resolve()) are removed, so the
+    # store does not depend on which worker met the parameter first.
+    if withdrawn:
+        ids = ",".join(str(p["id"]) for p in params if (p["type"], p["code"]) in withdrawn)
+        for table in INSERT:
+            db.execute(f"DELETE FROM sp_{table} WHERE param IN ({ids})")
     complete = 0
     for url in sorted(definitions.valuesets):
         ok, codes = definitions.expand(url)
@@ -484,7 +517,7 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
     duplicates += _drop_duplicates(db, counts, strings)
     db.executescript(rest)
     db.execute("ANALYZE")
-    supported = {(p["type"], p["code"]) for items in extractor.by_type.values() for p, _, _ in items}
+    supported = {(p["type"], p["code"]) for items in registry.by_type.values() for p, _, _ in items}
     supported |= {(t, c) for t in counts for c in ("_id", "_lastUpdated")}
     compartments = {}
     for code, members in definitions.compartments.items():
@@ -499,7 +532,7 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
             "packages": definitions.packages, "duplicates_skipped": duplicates, "contained_resources": contained_count,
             "unresolved_conditional_references": sorted(unresolved)[:100], "unresolved_conditional_count": len(unresolved),
             "valuesets": {"total": len(definitions.valuesets), "complete": complete},
-            "unsupported_expressions": extractor.unsupported,
+            "unsupported_expressions": registry.unsupported,
             "fhir_resource_types": sorted(definitions.model.resource_types),
             "elements": {t: sorted({path.split(".")[1].replace("[x]", "") for path in definitions.model.elements
                                     if path.startswith(t + ".") and path.count(".") == 1}) for t in counts},
@@ -514,5 +547,107 @@ def load(inputs, definitions_path, output, *, packages=(), settings=None, fullte
     os.replace(staging, output)
     print(json.dumps({"output": str(output), "resources": sum(counts.values()), "counts": counts, "duplicates_skipped": duplicates,
                       "unresolved_conditional_references": len(unresolved), "seconds": round(time.time() - started),
-                      "unsupported_expressions": extractor.unsupported}), flush=True)
+                      "unsupported_expressions": registry.unsupported}), flush=True)
     return output
+
+
+# ---- extraction workers ------------------------------------------------------------------
+# Index row columns that hold interned strings (systems, target types). Workers return the
+# strings and their own batch-local pids; the writing process numbers and interns them.
+INTERNED = {"token": (1,), "ident_type": (1,), "ref": (1,), "ref_ident": (1,), "quantity": (3,), "composite": (1, 3)}
+_WORKER = {}
+
+
+def preassigned_params(definitions):
+    """{resource type: parameters} with ids fixed by the definitions alone."""
+    out = {}
+    for i, p in enumerate(definitions.params_for(sorted(definitions.model.resource_types)), 1):
+        p["id"] = i
+        out.setdefault(p["type"], []).append(p)
+    return out
+
+
+def _setup(definitions, tz, local_bases, conditional, meta_patch, fulltext):
+    _WORKER.update(params=preassigned_params(definitions), registered=set(), conditional=conditional,
+                   meta_patch=meta_patch, fulltext=fulltext,
+                   extractor=Extractor(definitions.model, [], lambda value: value, tz, local_bases))
+
+
+def _init_worker(definitions_path, packages, timezone_name, local_bases, conditional, meta_patch, fulltext):
+    _setup(Definitions(definitions_path, packages), resolve_timezone(timezone_name), local_bases, conditional,
+           meta_patch, fulltext)
+
+
+def _process(items, source):
+    """One batch: resources and index rows with batch-local pids (1..n) and uninterned strings."""
+    w = _WORKER
+    extractor, conditional, meta_patch, fulltext = w["extractor"], w["conditional"], w["meta_patch"], w["fulltext"]
+    resources, fts, rows = [], [], {t: [] for t in TABLES}
+    counts, unresolved, withdrawn = {}, set(), []
+    local = contained_count = top = 0
+
+    def ensure(rtype):
+        if rtype not in w["registered"]:
+            if rtype not in w["params"]:
+                raise ValueError(f"Resource type {rtype} is not defined in the loaded FHIR definitions")
+            extractor.add(w["params"][rtype])
+            w["registered"].add(rtype)
+
+    def extract(resource, pid, scope):
+        before = len(extractor.unsupported)
+        for table, found in extractor.rows(resource, pid, scope).items():
+            rows[table].extend(found)
+        withdrawn.extend(extractor.unsupported[before:])
+
+    for item in items:
+        for resource in (unpack(json.loads(item)) if isinstance(item, str) else (item,)):
+            rtype = resource.get("resourceType")
+            if not rtype or not resource.get("id"):
+                raise ValueError(f"Resource without resourceType/id in {source}")
+            unresolved |= resolve_conditional(resource, conditional)
+            resource["meta"] = {**resource.get("meta", {}), **meta_patch}
+            text = json.dumps(resource, ensure_ascii=False, separators=(",", ":"))
+            ensure(rtype)
+            local += 1
+            top += 1
+            counts[rtype] = counts.get(rtype, 0) + 1
+            container = local
+            resources.append((local, rtype, resource["id"], zlib.compress(text.encode("utf-8"), 6), None))
+            scope, contained = contained_resources(resource)
+            extract(resource, local, scope)
+            if fulltext:
+                fts.append((container, " ".join(_text_leaves(resource, [])), _narrative(resource)))
+            for row_id, inner_resource, inner in contained:
+                ctype = inner_resource["resourceType"]
+                ensure(ctype)
+                counts.setdefault(ctype, 0)
+                local += 1
+                contained_count += 1
+                ctext = json.dumps(inner_resource, ensure_ascii=False, separators=(",", ":"))
+                resources.append((local, ctype, row_id, zlib.compress(ctext.encode("utf-8"), 6), container))
+                extract(inner_resource, local, inner)
+    return {"n": local, "top": top, "resources": resources, "rows": {t: list(r) for t, r in rows.items()},
+            "fts": fts, "counts": counts, "contained": contained_count, "unresolved": sorted(unresolved),
+            "withdrawn": withdrawn}
+
+
+def _ordered(pool, batches, depth):
+    """Results of batches in input order, with at most depth batches in flight."""
+    pending = deque()
+    for path, items in batches:
+        pending.append((path, pool.submit(_process, items, path.name)))
+        if len(pending) >= depth:
+            path, future = pending.popleft()
+            yield path, future.result()
+    while pending:
+        path, future = pending.popleft()
+        yield path, future.result()
+
+
+def _remap(row, cols, base, intern):
+    row = list(row)
+    for c in cols:
+        if row[c] is not None:
+            row[c] = intern(row[c])
+    row[-1] += base
+    return row

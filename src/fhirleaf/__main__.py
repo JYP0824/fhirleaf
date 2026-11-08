@@ -30,6 +30,8 @@ def main(argv=None):
     a.add_argument("--max-count", type=int, default=1000)
     a.add_argument("--last-updated", help="meta.lastUpdated stamped on every resource (default: load time)")
     a.add_argument("--no-hash", action="store_true", help="Skip source file SHA-256 (large inputs)")
+    a.add_argument("--workers", type=int, default=1,
+                   help="Processes that parse and extract in parallel (the store is the same for any number)")
     g = sub.add_parser("get", help="One request against a store, JSON to stdout")
     g.add_argument("--db", required=True)
     g.add_argument("--base-url", default="http://localhost/fhir")
@@ -102,7 +104,7 @@ def main(argv=None):
         if args.last_updated:
             settings["last_updated"] = args.last_updated
         load(args.inputs, args.definitions, args.output, packages=args.package, settings=settings,
-             fulltext=args.fulltext, hash_sources=not args.no_hash)
+             fulltext=args.fulltext, hash_sources=not args.no_hash, workers=args.workers)
     elif args.command == "get":
         status, body = Engine(args.db, base_url=args.base_url).get(args.request, "lenient" if args.lenient else "strict")
         json.dump({"status": status, "body": body}, sys.stdout, ensure_ascii=False, indent=1)

@@ -37,6 +37,14 @@ def _open(path):
     return gzip.open(path, "rt", encoding="utf-8") if path.name.endswith(".gz") else open(path, encoding="utf-8")
 
 
+def read_lines(path):
+    """Non-empty lines of an NDJSON file, unparsed."""
+    with _open(path) as handle:
+        for line in handle:
+            if line.strip():
+                yield line
+
+
 def read_file(path):
     """Resources of one input file, Bundles unpacked."""
     if path.name.endswith((".ndjson", ".ndjson.gz")):
