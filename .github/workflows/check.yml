@@ -1,0 +1,23 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cases:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: HL7 R4 definitions (CC0)
+        run: curl -fsSL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
+      - name: Specification cases
+        run: uv run --no-dev fhirleaf verify --cases --definitions definitions-r4.json.zip --output cases.json
+      - name: Build
+        run: uv build
