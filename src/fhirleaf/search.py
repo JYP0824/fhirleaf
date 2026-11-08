@@ -13,6 +13,7 @@ from itertools import count
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
+from .extract import TABLES as INDEX_TABLES
 from .store import READABLE, VERSION as STORE_VERSION
 from .values import (date_range, normalize, number_bounds, phonetic_codes, resolve_timezone, split_escaped, split_or,
                      split_prefix,
@@ -246,17 +247,34 @@ class Engine:
             self.writer = Writer(self, definitions, packages, clock)
             self._state()
         self._data_version = self.db.execute("PRAGMA data_version").fetchone()[0]
+        self._writes = 0
 
     def close(self):
         """Close the connection. A writable one first folds its WAL back into the file, so the store
         can again be opened immutable."""
         if self.writable:
             try:
+                self._optimize()
                 self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 self.db.execute("PRAGMA journal_mode = DELETE")
             except sqlite3.OperationalError:      # other connections are open: the last writer to close folds it
                 pass
         self.db.close()
+
+    def _optimize(self):
+        """Refresh query-planner statistics that writes made stale: ANALYZE a table that has rows but no
+        statistics (a store that started empty has none) or grew more than tenfold since. Statistics a
+        load computed for unchanged tables are kept."""
+        known = {}
+        for table, stat in self.db.execute("SELECT tbl, stat FROM sqlite_stat1 WHERE idx IS NOT NULL"):
+            known[table] = max(known.get(table, 0), int(stat.split()[0]))
+        tables = ["resources", "written", "versions"] + [f"sp_{t}" for t in INDEX_TABLES]
+        stale = [t for t in tables if (rows := self.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])
+                 and (t not in known or rows > 10 * known[t])]
+        for table in stale:
+            self.db.execute(f"ANALYZE {table}")
+        if stale:
+            self._results.clear()
 
     def __enter__(self):
         return self
@@ -431,6 +449,9 @@ class Engine:
         self._results.clear()
         self._ids.clear()
         self.has_written = True
+        self._writes += 1
+        if self._writes == 100 or self._writes % 1000 == 0:
+            self._optimize()
         self.meta["resource_counts"] = self.writer.counts
         if self.writer.changed:
             self._state()

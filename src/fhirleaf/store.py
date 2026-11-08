@@ -331,7 +331,9 @@ def capability(params, supported, settings, definitions, compartments):
             f"results without _sort are in stable store order; near without a distance uses "
             f"{settings['near_default_km']} km; phonetic parameters match name parts, letters by American Soundex and digits exactly; "
             f"token codes and identifier values compare case-insensitively (ASCII); date 'ap' is 10% of the distance "
-            + ("from the current time." if writable else f"from the load instant {settings['last_updated']}."))
+            + ("from the current time. Writes do not check that references resolve and do not validate resources "
+               "against profiles. An update with unchanged content creates no new version." if writable
+               else f"from the load instant {settings['last_updated']}."))
     return {"resourceType": "CapabilityStatement", "status": "active", "kind": "instance",
             "fhirVersion": definitions.fhir_version, "date": settings["last_updated"],
             "format": ["application/fhir+json"], "software": {"name": "fhirleaf", "version": VERSION},

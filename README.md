@@ -13,7 +13,7 @@ A store is read-only unless it is opened writable, for create, update and delete
 ## Quick start
 
 ```bash
-uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.2.0"
+uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.2.1"
 curl -fL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
 fhirleaf verify --cases --definitions definitions-r4.json.zip
 fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store.db
@@ -25,11 +25,11 @@ fhirleaf serve --db store.db --port 8080
 
 | Source | Command |
 |---|---|
-| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.2.0"` |
+| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.2.1"` |
 | PyPI (after release) | `uv add fhirleaf` |
-| Wheel | `uv add ./fhirleaf-0.2.0-py3-none-any.whl` |
+| Wheel | `uv add ./fhirleaf-0.2.1-py3-none-any.whl` |
 | Local checkout | `uv add --editable ./fhirleaf` |
-| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.2.0"` |
+| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.2.1"` |
 
 `pip install` takes the same sources.
 
@@ -137,7 +137,7 @@ Empty parameters are ignored in both modes.
 | Command | What it checks | Result |
 |---|---|---|
 | `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP. CI runs them on Python 3.10, 3.12 and 3.13. | 306/306 cases, 157/157 combinations |
-| (same command) | Write steps on a writable fixture, and stores filled by writes against fresh loads of the same resources | 51/51 steps, both stores equal |
+| (same command) | Write steps worked out from R4 http.html, run in process and over HTTP. Stores filled by writes against fresh loads, a failed write rolled back, and concurrent If-Match updates | 61/61 steps, 4/4 checks |
 | `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching, with per-parameter coverage | MIMIC-IV-on-FHIR Demo 1,240/1,240, Synthea + US Core 2,431/2,431 |
 | `fhirleaf support --definitions D --output FILE` | Status of every SearchParameter per resource type | R4: 2,873 of 3,026 supported |
 

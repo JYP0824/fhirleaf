@@ -15,6 +15,7 @@ import json
 import re
 import shutil
 import sqlite3
+import threading
 import zlib
 from collections import Counter
 from datetime import datetime
@@ -46,6 +47,8 @@ P1 = next(r for r in FIXTURE if r["resourceType"] == "Patient" and r["id"] == "p
 P1_V2 = {**copy.deepcopy(P1), "name": [{"family": "Schmidt", "given": ["Anna"]}]}
 P1_V3 = {**copy.deepcopy(P1_V2), "gender": "unknown"}
 O1 = next(r for r in FIXTURE if r["resourceType"] == "Observation" and r["id"] == "o1")
+O4_P3 = {**copy.deepcopy(next(r for r in FIXTURE if r["resourceType"] == "Observation" and r["id"] == "o4")),
+         "subject": {"reference": "Patient/p3"}}
 CONTAINED = {"resourceType": "MedicationRequest", "id": "mrw", "status": "active", "intent": "order",
              "subject": {"reference": "Patient/p2"}, "medicationReference": {"reference": "#mw"},
              "contained": [{"resourceType": "Medication", "id": "mw", "code": {"coding": [{"system": "urn:w", "code": "w1"}]}}]}
@@ -107,6 +110,21 @@ STEPS = [
     ("recreate", "PUT", "Observation/o1", O1, {}, _t(10), {"status": 201, "version": "3"}),
     ("recreate-searchable", "GET", "Observation?code=8867-4", None, {}, _t(10),
      {"status": 200, "match": ["Observation/o1", "Observation/o2", "Observation/o6", "Observation/o11"]}),
+    ("history-recreated", "GET", "Observation/o1/_history", None, {}, _t(10),
+     {"status": 200, "total": 3, "versions": ["3", "2", "1"], "entries": [("PUT", True), ("DELETE", False), ("PUT", True)]}),
+    ("chain-before", "GET", "Patient?organization.name=General", None, {}, _t(10), {"status": 200, "match": ["Patient/p2"]}),
+    ("chain-target-update", "PUT", "Organization/org1", {"resourceType": "Organization", "id": "org1", "name": "City Clinic"},
+     {}, _t(10), {"status": 200, "version": "2"}),
+    ("chain-old-name", "GET", "Patient?organization.name=General", None, {}, _t(10), {"status": 200, "match": []}),
+    ("chain-new-name", "GET", "Patient?organization.name=City", None, {}, _t(10), {"status": 200, "match": ["Patient/p2"]}),
+    ("has-before", "GET", "Patient?_has:Observation:patient:code=2339-0", None, {}, _t(10),
+     {"status": 200, "match": ["Patient/p1", "Patient/p2"]}),
+    ("has-source-delete", "DELETE", "Observation/o3", None, {}, _t(10), {"status": 204}),
+    ("has-after-delete", "GET", "Patient?_has:Observation:patient:code=2339-0", None, {}, _t(10),
+     {"status": 200, "match": ["Patient/p2"]}),
+    ("has-source-update", "PUT", "Observation/o4", O4_P3, {}, _t(10), {"status": 200, "version": "2"}),
+    ("has-after-update", "GET", "Patient?_has:Observation:patient:code=2339-0", None, {}, _t(10),
+     {"status": 200, "match": ["Patient/p3"]}),
     ("contained", "PUT", "MedicationRequest/mrw", CONTAINED, {}, _t(11), {"status": 201}),
     ("contained-searchable", "GET", "Medication?_contained=true&code=urn:w|w1", None, {}, _t(11),
      {"status": 200, "match": ["MedicationRequest/mrw"]}),     # _containedType defaults to container
@@ -293,4 +311,64 @@ def equivalence(fixture_db, definitions_path, packages, work):
          settings=dict(SETTINGS))
     report["writes_equal_fresh_load"] = ([f"write statuses {statuses}"] if statuses != [200, 204, 201] else []) + \
         compare(snapshot(fresh, drop_version=True), snapshot(changed, drop_version=True))
+    report["failed_write_rolls_back"] = rollback(changed, definitions_path, packages)
+    report["if_match_race_one_winner"] = if_match_race(fixture_db, definitions_path, packages, work)
     return report
+
+
+def _counts(path):
+    db = sqlite3.connect(path)
+    out = [db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("strings", "versions", "written", "resources")]
+    db.close()
+    return out
+
+
+def rollback(path, definitions_path, packages):
+    """An update that fails after the old version was moved and its index rows deleted (a value
+    that cannot be indexed) leaves the store as it was."""
+    before, counts = snapshot(path), _counts(path)
+    p2 = next(r for r in FIXTURE if r["resourceType"] == "Patient" and r["id"] == "p2")
+    bad = {**copy.deepcopy(p2), "birthDate": "1990-13-45", "name": [{"family": "Rollback"}]}
+    with Engine(path, writable=True, definitions=definitions_path, packages=packages) as engine:
+        status = engine.put("Patient/p2", bad)[0]
+        read = engine.get("Patient/p2")[1]
+    problems = [] if status == 400 else [f"status {status}, expected 400"]
+    if read.get("name", [{}])[0].get("family") != "Mueller" or read.get("meta", {}).get("versionId") != "1":
+        problems.append(f"Patient/p2 after the failed update: {read.get('name')} version {read.get('meta')}")
+    if _counts(path) != counts:
+        problems.append(f"rows (strings, versions, written, resources) {counts} -> {_counts(path)}")
+    return problems + compare(before, snapshot(path))
+
+
+def if_match_race(fixture_db, definitions_path, packages, work, rounds=20):
+    """Two connections read the same version and update it at once with If-Match: one wins (200),
+    the other gets 412, in every round."""
+    path = work / "race.sqlite"
+    shutil.copy(fixture_db, path)
+    p3 = next(r for r in FIXTURE if r["resourceType"] == "Patient" and r["id"] == "p3")
+    engines = [Engine(path, writable=True, definitions=definitions_path, packages=packages) for _ in range(2)]
+    problems = []
+    try:
+        for n in range(rounds):
+            version = engines[0].get("Patient/p3")[1]["meta"]["versionId"]
+            barrier, statuses = threading.Barrier(2), [None, None]
+
+            def write(k):
+                body = {**copy.deepcopy(p3), "name": [{"family": f"Race{n}", "given": [str(k)]}]}
+                barrier.wait()
+                statuses[k] = engines[k].put("Patient/p3", body, if_match=f'W/"{version}"')[0]
+
+            threads = [threading.Thread(target=write, args=(k,)) for k in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            if sorted(statuses) != [200, 412]:
+                problems.append(f"round {n}: statuses {statuses}")
+        total = engines[0].get("Patient/p3/_history?_count=1")[1].get("total")
+        if total != rounds + 1:
+            problems.append(f"history total {total}, expected {rounds + 1}")
+    finally:
+        for e in engines:
+            e.close()
+    return problems
