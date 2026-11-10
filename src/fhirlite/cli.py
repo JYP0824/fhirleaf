@@ -1,18 +1,19 @@
-"""CLI: load | get | serve | verify | support | corpus | record | compare."""
+"""Command line: load | get | serve | verify | support | corpus | record | compare."""
 from __future__ import annotations
 
 import argparse
 import json
 import sys
 
-from . import conformance
-from .search import Engine
+from .conformance import corpus
+from .search.engine import Engine
 from .server import serve
-from .store import load
+from .store.load import load
+
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="fhirleaf", description=__doc__)
+    p = argparse.ArgumentParser(prog="fhirlite", description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
     a = sub.add_parser("load", help="FHIR resources -> fresh store")
     a.add_argument("--input", "--fhir-dir", dest="inputs", action="append", default=[],
@@ -85,11 +86,11 @@ def main(argv=None):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     if args.command == "support":
-        from .support import write_support
+        from .conformance.support import write_support
         print(json.dumps(write_support(args.definitions, args.package, args.output), ensure_ascii=False, indent=1))
         return
     if args.command == "verify" and args.cases:
-        from .casecheck import run_cases
+        from .conformance.casecheck import run_cases
         report = run_cases(args.definitions, args.output)
         ok = not (report["failed"] or report["uncovered_or_failing_combinations"] or report["write_failed"]
                   or any(report["equivalence"].values()))
@@ -97,7 +98,7 @@ def main(argv=None):
     if args.command == "verify":
         if not args.inputs or not args.output:
             p.error("verify needs --input and --output (or --cases)")
-        from .verify import verify
+        from .conformance.oracle import verify
         verify(args.inputs, args.definitions, args.output, packages=args.package, fulltext=args.fulltext,
                patients=args.patients, seed=args.seed,
                settings={"timezone": args.timezone, "last_updated": "2026-01-01T00:00:00.000+00:00"})
@@ -127,12 +128,12 @@ def main(argv=None):
             if server.engine:
                 server.engine.close()
     elif args.command == "corpus":
-        conformance.make_corpus(args.db, args.output, seed=args.seed, patients=args.patients,
+        corpus.make_corpus(args.db, args.output, seed=args.seed, patients=args.patients,
                                 values_per_param=args.values_per_param)
     elif args.command == "record":
-        conformance.record(args.base_url, args.requests, args.output, max_pages=args.max_pages)
+        corpus.record(args.base_url, args.requests, args.output, max_pages=args.max_pages)
     elif args.command == "compare":
-        conformance.compare(args.db, args.recorded, args.report)
+        corpus.compare(args.db, args.recorded, args.report)
 
 
 if __name__ == "__main__":

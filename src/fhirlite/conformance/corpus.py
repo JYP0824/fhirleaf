@@ -20,7 +20,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import quote, urljoin
 
-from .search import Engine
+from ..search.engine import Engine
+
 
 VOLATILE_META = ("versionId", "lastUpdated", "source")
 

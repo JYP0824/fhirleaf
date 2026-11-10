@@ -21,7 +21,8 @@ from datetime import datetime
 from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .search import Engine
+from .search.engine import Engine
+
 
 PREFIX = "/fhir"
 MAX_BODY = 1 << 20
@@ -101,7 +102,7 @@ def serve(db_path, host="127.0.0.1", port=0, public_base=None, default_handling=
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        server_version = "fhirleaf"
+        server_version = "fhirlite"
 
         def log_message(self, fmt, *args):  # quiet by default
             pass

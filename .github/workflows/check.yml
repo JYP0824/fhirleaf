@@ -18,6 +18,6 @@ jobs:
       - name: HL7 R4 definitions (CC0)
         run: curl -fsSL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
       - name: Specification cases
-        run: uv run --no-dev fhirleaf verify --cases --definitions definitions-r4.json.zip --output cases.json
+        run: uv run --no-dev fhirlite verify --cases --definitions definitions-r4.json.zip --output cases.json
       - name: Build
         run: uv build

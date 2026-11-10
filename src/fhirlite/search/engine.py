@@ -13,11 +13,13 @@ from itertools import count
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
-from .extract import TABLES as INDEX_TABLES
-from .store import READABLE, VERSION as STORE_VERSION
-from .values import (date_range, normalize, number_bounds, phonetic_codes, resolve_timezone, split_escaped, split_or,
-                     split_prefix,
-                     unescape)
+from ..model.values import (date_range, normalize, number_bounds, phonetic_codes, resolve_timezone, split_escaped,
+                            split_or, split_prefix, unescape)
+from ..store.extract import TABLES as INDEX_TABLES
+from ..store.schema import FORMAT
+from .errors import SearchError, operation_outcome
+from .text import fts_query, parse_text_query
+
 
 CONTROL = frozenset({"_count", "_sort", "_include", "_revinclude", "_summary", "_elements", "_total", "_format",
                      "_pretty", "_contained", "_containedType"})
@@ -33,15 +35,8 @@ SUBSETTED = {"system": "http://terminology.hl7.org/CodeSystem/v3-ObservationValu
              "display": "Resource encoded in summary mode"}
 
 
-class SearchError(Exception):
-    def __init__(self, status, diagnostics, code="processing"):
-        super().__init__(diagnostics)
-        self.status, self.diagnostics, self.code = status, diagnostics, code
 
 
-def operation_outcome(error):
-    return {"resourceType": "OperationOutcome",
-            "issue": [{"severity": "error", "code": error.code, "diagnostics": error.diagnostics}]}
 
 
 CONTROL_VALUES = {"_summary": {"true", "false", "text", "data", "count"}, "_total": {"none", "estimate", "accurate"},
@@ -104,112 +99,15 @@ class Crit:
         return self.cond.replace("{a}", alias), self.args
 
 
-TEXT_TOKEN = re.compile(r'\s*(?:(\()|(\))|"([^"]*)"|([^\s()"]+))')
 
 
-def parse_text_query(text):
-    """_text/_content syntax: words (implicit AND), "quoted phrases", AND, OR, NOT (any case) and
-    parentheses. Returns a tree: ("word", [terms]) | ("and"|"or", [a, b]) | ("not", [a]), or None."""
-    tokens, pos = [], 0
-    while pos < len(text):
-        m = TEXT_TOKEN.match(text, pos)
-        if not m or m.end() == pos:
-            if text[pos:].strip():
-                raise ValueError("unbalanced quote")
-            break
-        pos = m.end()
-        if m.group(1):
-            tokens.append(("(", None))
-        elif m.group(2):
-            tokens.append((")", None))
-        elif m.group(3) is not None:
-            words = re.findall(r"[^\W_]+", m.group(3))
-            if words:
-                tokens.append(("word", words))
-        else:
-            word = m.group(4)
-            if word.upper() in ("AND", "OR", "NOT"):
-                tokens.append((word.upper(), None))
-            else:
-                words = re.findall(r"[^\W_]+", word)
-                if words:
-                    tokens.append(("word", words))
-    i = 0
-
-    def expr():
-        nonlocal i
-        left = term()
-        while i < len(tokens) and tokens[i][0] == "OR":
-            i += 1
-            left = ("or", [left, term()])
-        return left
-
-    def term():
-        nonlocal i
-        left = factor()
-        while i < len(tokens) and tokens[i][0] not in ("OR", ")"):
-            if tokens[i][0] == "AND":
-                i += 1
-            left = ("and", [left, factor()])
-        return left
-
-    def factor():
-        nonlocal i
-        if i >= len(tokens):
-            raise ValueError("incomplete expression")
-        kind, words = tokens[i]
-        i += 1
-        if kind == "NOT":
-            return ("not", [factor()])
-        if kind == "(":
-            inner = expr()
-            if i >= len(tokens) or tokens[i][0] != ")":
-                raise ValueError("missing )")
-            i += 1
-            return inner
-        if kind == "word":
-            return ("word", words)
-        raise ValueError(f"unexpected {kind}")
-
-    if not tokens:
-        return None
-    tree = expr()
-    if i != len(tokens):
-        raise ValueError("unexpected )")
-    return tree
 
 
-def _fts(tree):
-    kind, items = tree
-    if kind == "word":
-        return '"' + " ".join(w.replace('"', "") for w in items) + '"'
-    if kind == "not":
-        raise ValueError("NOT needs a left side")
-    if kind == "and":
-        left, right = items
-        if right[0] == "not":
-            return f"({_fts(left)} NOT {_fts(right[1][0])})"
-        if left[0] == "not":
-            return f"({_fts(right)} NOT {_fts(left[1][0])})"
-        return f"({_fts(left)} AND {_fts(right)})"
-    return f"({_fts(items[0])} OR {_fts(items[1])})"
 
 
-def text_match(tree, words):
-    """Evaluate a parsed _text/_content query against a document's normalized words (oracle)."""
-    kind, items = tree
-    if kind == "word":
-        n = len(items)
-        terms = [normalize(w) for w in items]
-        return any(words[k:k + n] == terms for k in range(len(words) - n + 1))
-    if kind == "not":
-        return not text_match(items[0], words)
-    if kind == "and":
-        return text_match(items[0], words) and text_match(items[1], words)
-    return text_match(items[0], words) or text_match(items[1], words)
 
 
-def _distance_km(lat1, lon1, lat2, lon2):
+def distance_km(lat1, lon1, lat2, lon2):
     p1, p2 = math.radians(lat1), math.radians(lat2)
     a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
     return 2 * 6371.0088 * math.asin(min(1.0, math.sqrt(a)))
@@ -237,13 +135,11 @@ class Engine:
         else:
             self.db = sqlite3.connect(self.path.as_uri() + "?mode=ro&immutable=1", uri=True, check_same_thread=False)
         self.live = writable or Path(str(self.path) + "-wal").exists()
-        self.db.create_function("distance_km", 4, _distance_km, deterministic=True)
+        self.db.create_function("distance_km", 4, distance_km, deterministic=True)
         self._state()
         if writable:
-            if not self.versioned:
-                raise ValueError(f"A writable connection needs a {STORE_VERSION} store; rebuild this one with fhirleaf load")
             self.db.execute("PRAGMA journal_mode = WAL")
-            from .write import Writer
+            from ..store.write import Writer
             self.writer = Writer(self, definitions, packages, clock)
             self._state()
         self._data_version = self.db.execute("PRAGMA data_version").fetchone()[0]
@@ -293,9 +189,8 @@ class Engine:
 
     def _state(self):
         meta = {k: json.loads(v) for k, v in self.db.execute("SELECT key, value FROM meta")}
-        if meta.get("version") not in READABLE:
-            raise ValueError(f"Store format {meta.get('version')} is not {STORE_VERSION}; rebuild it with this fhirleaf")
-        self.versioned = meta["version"] == STORE_VERSION
+        if meta.get("version") != FORMAT:
+            raise ValueError(f"Store format {meta.get('version')} is not {FORMAT}; rebuild it with this fhirlite")
         self.meta, self.settings = meta, dict(meta["settings"])
         default_count, max_count = self._overrides
         for key, value in (("default_count", default_count), ("max_count", max_count)):
@@ -304,8 +199,8 @@ class Engine:
                     raise ValueError(f"{key} must be at least 1")
                 self.settings[key] = int(value)
         self.tz = resolve_timezone(self.settings["timezone"])
-        self.history_enabled = bool(self.settings.get("writable")) and self.versioned
-        self.has_written = self.versioned and bool(self.db.execute("SELECT 1 FROM written LIMIT 1").fetchone())
+        self.history_enabled = bool(self.settings.get("writable"))
+        self.has_written = bool(self.db.execute("SELECT 1 FROM written LIMIT 1").fetchone())
         self.loaded = set(meta["resource_counts"])
         self.compartments = meta.get("compartments", {})
         self.fhir_types = set(meta.get("fhir_resource_types") or meta["resource_counts"])
@@ -521,11 +416,10 @@ class Engine:
         row = self.db.execute("SELECT r.json FROM resources r WHERE r.type_id = ? AND r.id = ? AND r.container IS NULL",
                               (self.sid(rtype), rid)).fetchone()
         if not row:
-            if self.versioned:
-                last = self.db.execute("SELECT json IS NULL FROM versions WHERE type_id = ? AND id = ? "
-                                       "ORDER BY version DESC LIMIT 1", (self.sid(rtype), rid)).fetchone()
-                if last and last[0]:
-                    raise SearchError(410, f"Resource {rtype}/{rid} was deleted", "deleted")
+            last = self.db.execute("SELECT json IS NULL FROM versions WHERE type_id = ? AND id = ? "
+                                   "ORDER BY version DESC LIMIT 1", (self.sid(rtype), rid)).fetchone()
+            if last and last[0]:
+                raise SearchError(410, f"Resource {rtype}/{rid} was deleted", "deleted")
             raise SearchError(404, f"Resource {rtype}/{rid} is not known", "not-found")
         return json.loads(zlib.decompress(row[0]))
 
@@ -561,12 +455,12 @@ class Engine:
         try:
             resource = self.read(rtype, rid)
         except SearchError as exc:
-            if exc.status != 410 or not self.versioned:
+            if exc.status != 410:
                 raise
             resource = None
         if resource is not None and (resource.get("meta") or {}).get("versionId") == vid:
             return resource
-        if self.versioned and vid.isdigit():
+        if vid.isdigit():
             row = self.db.execute("SELECT json FROM versions WHERE type_id = ? AND id = ? AND version = ?",
                                   (self.sid(rtype), rid, int(vid))).fetchone()
             if row and row[0] is None:
@@ -1125,7 +1019,7 @@ class Engine:
         for v in split_or(value):
             prefix, low, high = self._date_bounds(v)
             approx = self._approx(low, high)
-            ok = ok or _date_eval(prefix, t_low, t_high, low, high, approx)
+            ok = ok or date_eval(prefix, t_low, t_high, low, high, approx)
             sql, a = _date_sql(prefix, "w.low", "w.high", low, high, approx)
             clauses.append(sql)
             args += a
@@ -1176,7 +1070,7 @@ class Engine:
                 raise SearchError(400, f'Invalid {code} value "{v}": {exc}') from exc
             if tree is not None:
                 try:
-                    alternatives.append(_fts(tree))
+                    alternatives.append(fts_query(tree))
                 except ValueError as exc:
                     raise SearchError(400, f'Invalid {code} value "{v}": {exc}') from exc
         if not alternatives:
@@ -1622,7 +1516,7 @@ def _date_sql(prefix, low_col, high_col, low, high, approx):
     return f"({high_col} >= ? AND {low_col} <= ?)", list(approx)
 
 
-def _date_eval(prefix, t_low, t_high, low, high, approx):
+def date_eval(prefix, t_low, t_high, low, high, approx):
     inside = t_low >= low and t_high <= high
     return {"eq": inside, "ne": not inside, "gt": t_high > high, "lt": t_low < low,
             "ge": t_high > high or inside, "le": t_low < low or inside, "sa": t_low > high,

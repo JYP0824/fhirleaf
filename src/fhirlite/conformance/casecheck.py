@@ -14,9 +14,10 @@ from collections import defaultdict
 from pathlib import Path
 
 from .cases import CASES, DECLARED, FIXTURE, PACKAGE, SETTINGS
-from .search import Engine
-from .server import serve
-from .store import load
+from ..search.engine import Engine
+from ..server import serve
+from ..store.load import load
+
 
 
 def build_fixture(definitions_path, workdir):
@@ -25,7 +26,7 @@ def build_fixture(definitions_path, workdir):
     (work / "data" / "fixture.ndjson").write_text("".join(json.dumps(r) + "\n" for r in FIXTURE), encoding="utf-8")
     package = work / "fixture-package.tgz"
     with tarfile.open(package, "w:gz") as archive:
-        for name, obj in [("package/package.json", {"name": "fhirleaf.cases", "version": "1.0.0"})] + \
+        for name, obj in [("package/package.json", {"name": "fhirlite.cases", "version": "1.0.0"})] + \
                          [(f"package/ValueSet-{v['id']}.json", v) for v in PACKAGE]:
             data = json.dumps(obj).encode("utf-8")
             info = tarfile.TarInfo(name)
@@ -128,7 +129,7 @@ def _judge(expect, status, matches, includes, body, headers=None, raw_body=b""):
 
 
 def run_cases(definitions_path, output=None):
-    work = Path(tempfile.mkdtemp(prefix="fhirleaf-cases-"))
+    work = Path(tempfile.mkdtemp(prefix="fhirlite-cases-"))
     db = build_fixture(definitions_path, work)
     engine = Engine(db)
     server, base = serve(db, port=0)

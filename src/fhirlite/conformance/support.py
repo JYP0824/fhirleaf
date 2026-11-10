@@ -6,8 +6,9 @@ import json
 import re
 from collections import Counter
 
-from .extract import UNINDEXED, Extractor
-from .store import Definitions
+from ..model.definitions import Definitions
+from ..store.extract import Extractor
+
 
 # Modifiers the engine accepts per parameter type (a reference also takes a resource type, :Type).
 MODIFIERS = {

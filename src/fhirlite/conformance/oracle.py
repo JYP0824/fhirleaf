@@ -19,12 +19,17 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import parse_qsl
 
-from .conformance import make_corpus
-from .extract import contained_resources, Extractor
-from .search import CONTROL, Engine, _date_eval, _distance_km, parse_text_query, text_match
-from .inputs import conditional_key, input_files, read_file, resolve_conditional
-from .store import Definitions, _narrative, _text_leaves, load
-from .values import phonetic_codes, normalize, number_bounds, resolve_timezone, split_escaped, split_or, split_prefix, unescape
+from .corpus import make_corpus
+from ..model.definitions import Definitions
+from ..model.values import (normalize, number_bounds, phonetic_codes, resolve_timezone, split_escaped, split_or,
+                            split_prefix, unescape)
+from ..search.engine import CONTROL, Engine, date_eval, distance_km
+from ..search.text import parse_text_query, text_match
+from ..store.extract import Extractor, contained_resources
+from ..inputs import conditional_key, input_files, read_file, resolve_conditional
+from ..store.load import load
+from ..store.narrative import narrative, text_leaves
+
 
 TERM = re.compile(r"[^\W_]+")
 
@@ -152,8 +157,8 @@ class Oracle:
                 for row in items:
                     rows[(table, row[0])].append(row[1:-1])
             self.index[pid] = rows
-            self.words[pid] = ([normalize(w) for w in TERM.findall(" ".join(_text_leaves(r, [])))],
-                               [normalize(w) for w in TERM.findall(_narrative(r))])
+            self.words[pid] = ([normalize(w) for w in TERM.findall(" ".join(text_leaves(r, [])))],
+                               [normalize(w) for w in TERM.findall(narrative(r))])
         self.key = {(r["resourceType"], self.rowid[pid]): pid for pid, r in self.res.items()}
         self.vs = defaultdict(set)
         strings = dict(engine.db.execute("SELECT id, value FROM strings"))
@@ -294,7 +299,7 @@ class Oracle:
             low, high = self.e.last_updated
             for v in split_or(value):
                 prefix, s_low, s_high = self.e._date_bounds(v)
-                if _date_eval(prefix, low, high, s_low, s_high, self.e._approx(s_low, s_high)):
+                if date_eval(prefix, low, high, s_low, s_high, self.e._approx(s_low, s_high)):
                     return True
             return False
         if code in ("_content", "_text"):
@@ -314,7 +319,7 @@ class Oracle:
                 parts = split_escaped(v, "|")
                 km = (float(parts[2]) if len(parts) > 2 and parts[2] else self.e.settings.get("near_default_km", 1.0)) * \
                     {"km": 1.0, "m": 0.001, "mi": 1.609344, "[mi_i]": 1.609344}[parts[3] if len(parts) > 3 and parts[3] else "km"]
-                out = out or any(_distance_km(lat, lon, float(parts[0]), float(parts[1])) <= km
+                out = out or any(distance_km(lat, lon, float(parts[0]), float(parts[1])) <= km
                                  for lat, lon in self.rows(pid, "position", p))
             return out
         if p["ptype"] == "reference" and modifier == "identifier":
@@ -349,7 +354,7 @@ class Oracle:
                 out = out or any(ri == i and (t is None or rt == t) for rt, ri in self.rows(pid, "ref", p))
             return out
         if p["ptype"] == "date":
-            return any(_date_eval(b[0], lo, hi, b[1], b[2], self.e._approx(b[1], b[2]))
+            return any(date_eval(b[0], lo, hi, b[1], b[2], self.e._approx(b[1], b[2]))
                        for v in values for b in [self.e._date_bounds(v)] for lo, hi in self.rows(pid, "date", p))
         if p["ptype"] == "string" and p.get("usage") == "phonetic":
             have = {norm for norm, _ in self.rows(pid, "string", p)}
@@ -386,7 +391,7 @@ class Oracle:
                         return True
                     if kind == "date":
                         b = self.e._date_bounds(second)
-                        if _date_eval(b[0], lo, hi, b[1], b[2], self.e._approx(b[1], b[2])):
+                        if date_eval(b[0], lo, hi, b[1], b[2], self.e._approx(b[1], b[2])):
                             return True
                     if kind == "string" and (text or "").startswith(normalize(unescape(second))):
                         return True

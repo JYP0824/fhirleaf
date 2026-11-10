@@ -3,7 +3,7 @@
 A small hand-written fixture and, for every declared combination (parameter type x value form x
 modifier x prefix, result parameters, interactions, HTTP framing, rejections), requests whose
 expected results were worked out by hand from the FHIR R4 rules - not produced by running the
-engine. `fhirleaf verify --cases` builds the fixture store, runs every case in process and over
+engine. `fhirlite verify --cases` builds the fixture store, runs every case in process and over
 HTTP, and checks that each declared combination has at least one passing case.
 
 Fixture settings: zone UTC, store instant 2026-01-01T00:00:00Z, full text on, page 4 / max 6.

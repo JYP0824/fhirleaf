@@ -1,4 +1,4 @@
-"""fhirleaf: an embedded FHIR R4 search engine on one SQLite file (standard library only).
+"""fhirlite: an embedded FHIR R4 search engine on one SQLite file (standard library only).
 
 A SQLite file stores the unchanged resources and search index rows extracted
 with the official R4 SearchParameter expressions; `Engine.get(path)` answers
@@ -9,7 +9,7 @@ JVM or database service is needed; `server.serve` is an optional HTTP adapter.
 from .search import Engine, SearchError
 from .store import load
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 
 def connect(path, base_url="http://localhost/fhir", default_count=None, max_count=None, writable=False,

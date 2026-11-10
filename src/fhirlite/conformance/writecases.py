@@ -1,4 +1,4 @@
-"""Write cases for writable stores, run by `fhirleaf verify --cases`.
+"""Write cases for writable stores, run by `fhirlite verify --cases`.
 
 Steps: an ordered list of requests on a writable copy of the case fixture, with expectations
 worked out by hand from FHIR R4 (http.html: create, update, delete, read, vread, history-instance).
@@ -21,9 +21,11 @@ from collections import Counter
 from datetime import datetime
 
 from .cases import FIXTURE, SETTINGS
-from .extract import TABLES
-from .search import Engine
-from .store import INTERNED, load
+from ..search.engine import Engine
+from ..store.extract import TABLES
+from ..store.load import load
+from ..store.schema import INTERNED
+
 
 
 class Clock:

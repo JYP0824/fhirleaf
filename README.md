@@ -1,6 +1,6 @@
-# FHIRLeaf: An embedded FHIR R4 search engine
+# FHIRLite: An embedded FHIR R4 search engine
 
-FHIRLeaf is an embedded FHIR R4 search engine for Python.
+FHIRLite is an embedded FHIR R4 search engine for Python.
 It runs R4 RESTful Search on a portable SQLite file, in process or over HTTP, without deploying a FHIR server.
 A store is read-only unless it is opened writable, for create, update and delete.
 
@@ -13,23 +13,23 @@ A store is read-only unless it is opened writable, for create, update and delete
 ## Quick start
 
 ```bash
-uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.2.1"
+uv add "fhirlite @ git+https://github.com/JYP0824/fhirlite@v0.3.0"
 curl -fL https://hl7.org/fhir/R4/definitions.json.zip -o definitions-r4.json.zip
-fhirleaf verify --cases --definitions definitions-r4.json.zip
-fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store.db
-fhirleaf get --db store.db "Patient?birthdate=ge1990"
-fhirleaf serve --db store.db --port 8080
+fhirlite verify --cases --definitions definitions-r4.json.zip
+fhirlite load --input data/ --definitions definitions-r4.json.zip --output store.db
+fhirlite get --db store.db "Patient?birthdate=ge1990"
+fhirlite serve --db store.db --port 8080
 ```
 
 ## Install
 
 | Source | Command |
 |---|---|
-| Git tag | `uv add "fhirleaf @ git+https://github.com/JYP0824/fhirleaf@v0.2.1"` |
-| PyPI (after release) | `uv add fhirleaf` |
-| Wheel | `uv add ./fhirleaf-0.2.1-py3-none-any.whl` |
-| Local checkout | `uv add --editable ./fhirleaf` |
-| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirleaf@v0.2.1"` |
+| Git tag | `uv add "fhirlite @ git+https://github.com/JYP0824/fhirlite@v0.3.0"` |
+| PyPI (after release) | `uv add fhirlite` |
+| Wheel | `uv add ./fhirlite-0.3.0-py3-none-any.whl` |
+| Local checkout | `uv add --editable ./fhirlite` |
+| CLI only | `uv tool install "git+https://github.com/JYP0824/fhirlite@v0.3.0"` |
 
 `pip install` takes the same sources.
 
@@ -46,7 +46,7 @@ R4B and R5 definitions load, but search behaviour is R4 and only R4 is verified.
 ## Build a store
 
 ```bash
-fhirleaf load --input data/ --definitions definitions-r4.json.zip --output store.db
+fhirlite load --input data/ --definitions definitions-r4.json.zip --output store.db
 ```
 
 | Option | Effect |
@@ -69,16 +69,16 @@ Without `--input`, `load` makes an empty store to fill through a writable connec
 ## Search
 
 ```bash
-fhirleaf get --db store.db "Observation?patient=Patient/1&code=http://loinc.org|8867-4"
-fhirleaf get --db store.db "Patient/1"
-fhirleaf serve --db store.db --port 8080
+fhirlite get --db store.db "Observation?patient=Patient/1&code=http://loinc.org|8867-4"
+fhirlite get --db store.db "Patient/1"
+fhirlite serve --db store.db --port 8080
 curl "http://127.0.0.1:8080/fhir/Observation?patient=Patient/1&_count=10"
 ```
 
 ```python
-import fhirleaf
+import fhirlite
 
-store = fhirleaf.connect("store.db")
+store = fhirlite.connect("store.db")
 status, bundle = store.get("Observation?patient=Patient/1&date=ge2020-01-01")
 status, patient = store.get("Patient/1")
 status, bundle = store.post("Observation/_search", b"patient=Patient/1")
@@ -92,7 +92,7 @@ Open a store writable to create, update and delete.
 It needs the definitions and packages the store was built with.
 
 ```python
-store = fhirleaf.connect("store.db", writable=True, definitions="definitions-r4.json.zip")
+store = fhirlite.connect("store.db", writable=True, definitions="definitions-r4.json.zip")
 status, patient = store.post("Patient", {"resourceType": "Patient", "name": [{"family": "Lee"}]})
 status, patient = store.put(f"Patient/{patient['id']}", {**patient, "gender": "female"}, if_match='W/"1"')
 status, _ = store.delete(f"Patient/{patient['id']}")
@@ -100,7 +100,7 @@ store.close()
 ```
 
 ```bash
-fhirleaf serve --db store.db --writable --definitions definitions-r4.json.zip
+fhirlite serve --db store.db --writable --definitions definitions-r4.json.zip
 ```
 
 | Request | Result |
@@ -136,16 +136,16 @@ Empty parameters are ignored in both modes.
 
 | Command | What it checks |
 |---|---|
-| `fhirleaf verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP. Write steps worked out from R4 http.html. Stores filled by writes against fresh loads, a failed write rolled back, and concurrent If-Match updates. CI runs them on Python 3.10, 3.12 and 3.13. |
-| `fhirleaf verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching, with per-parameter coverage |
-| `fhirleaf support --definitions D --output FILE` | Status of every SearchParameter per resource type |
+| `fhirlite verify --cases --definitions D` | Hand-computed specification cases, in process and over HTTP. Write steps worked out from R4 http.html. Stores filled by writes against fresh loads, a failed write rolled back, and concurrent If-Match updates. CI runs them on Python 3.10, 3.12 and 3.13. |
+| `fhirlite verify --input DATA --definitions D --output DIR` | A request corpus on a patient subset against brute-force matching, with per-parameter coverage |
+| `fhirlite support --definitions D --output FILE` | Status of every SearchParameter per resource type |
 
 Compare with another FHIR server:
 
 ```bash
-fhirleaf corpus  --db store.db --output requests.jsonl
-fhirleaf record  --base-url http://other/fhir --requests requests.jsonl --output recorded.jsonl
-fhirleaf compare --db store.db --recorded recorded.jsonl --report report.json
+fhirlite corpus  --db store.db --output requests.jsonl
+fhirlite record  --base-url http://other/fhir --requests requests.jsonl --output recorded.jsonl
+fhirlite compare --db store.db --recorded recorded.jsonl --report report.json
 ```
 
 ## Supported
@@ -243,12 +243,27 @@ These cannot be detected from the request:
 - SampledData values
 - The repeated hour at a daylight-saving change, for times without an offset
 
+## Layout
+
+| Module | Role |
+|---|---|
+| `fhirlite` | Public API: `connect`, `load`, `Engine`, `SearchError` |
+| `fhirlite.model` | FHIR definitions, the FHIRPath subset, search value semantics |
+| `fhirlite.inputs` | NDJSON, Bundle, resource and package readers |
+| `fhirlite.store` | Store format, index extraction, load, CapabilityStatement, writes |
+| `fhirlite.search` | RESTful Search engine, `_content`/`_text` queries, errors |
+| `fhirlite.server` | Optional HTTP adapter |
+| `fhirlite.conformance` | Specification cases, brute-force oracle, corpus record and compare |
+| `fhirlite.cli` | The `fhirlite` command |
+
+A store records its format (`fhirlite-store-v1`). A store in another format is rebuilt with `fhirlite load`.
+
 ## Release
 
 ```bash
 uv build
 uv venv check && uv pip install --python check dist/*.whl
-check/bin/fhirleaf verify --cases --definitions definitions-r4.json.zip
+check/bin/fhirlite verify --cases --definitions definitions-r4.json.zip
 git tag vX.Y.Z && git push --tags
 uv publish
 ```
@@ -262,7 +277,7 @@ CORS is off by default. `serve --cors-origin ORIGIN` enables it for one origin.
 
 ## License
 
-FHIRLeaf is licensed under Apache-2.0 (`LICENSE`, `NOTICE`).
+FHIRLite is licensed under Apache-2.0 (`LICENSE`, `NOTICE`).
 The HL7 FHIR definitions are CC0 and are not redistributed.
-"FHIR" and "HL7" are HL7 trademarks, and FHIRLeaf is not an HL7 product.
+"FHIR" and "HL7" are HL7 trademarks, and FHIRLite is not an HL7 product.
 Package terminology and loaded data keep their own terms.

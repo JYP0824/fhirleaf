@@ -12,10 +12,14 @@ import uuid
 import zlib
 from datetime import datetime, timezone
 
-from .extract import TABLES, Extractor, contained_resources
-from .search import SearchError
-from .store import INSERT, INTERNED, Definitions, _flag, _narrative, _text_leaves, derived_meta, preassigned_params
-from .values import date_range, resolve_timezone
+from ..model.definitions import Definitions
+from ..model.values import date_range, resolve_timezone
+from ..search.errors import SearchError
+from .capability import derived_meta
+from .extract import Extractor, TABLES, contained_resources
+from .narrative import narrative, text_leaves
+from .schema import INSERT, INTERNED, flag, preassigned_params
+
 
 ID = re.compile(r"[A-Za-z0-9\-.]{1,64}")
 
@@ -63,8 +67,8 @@ class Writer:
                 for p in self.preassigned[rtype]:
                     db.execute("INSERT INTO params VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
                         p["id"], p["type"], p["code"], p["ptype"], p["url"], p.get("expression"),
-                        json.dumps(p["targets"]), json.dumps(p["components"]), p["usage"], _flag(p["multiple_or"]),
-                        _flag(p["multiple_and"])))
+                        json.dumps(p["targets"]), json.dumps(p["components"]), p["usage"], flag(p["multiple_or"]),
+                        flag(p["multiple_and"])))
                 self.extractor.add(self.preassigned[rtype])
                 self.counts[rtype] = 0
             self.config["writable"] = True
@@ -226,7 +230,7 @@ class Writer:
         self._extract(resource, pid, scope, rows)
         if self.fulltext:
             db.execute("INSERT INTO fts(rowid, content, narrative) VALUES (?,?,?)",
-                       (pid, " ".join(_text_leaves(resource, [])), _narrative(resource)))
+                       (pid, " ".join(text_leaves(resource, [])), narrative(resource)))
         for row_id, inner_resource, inner in contained:
             ctype = inner_resource["resourceType"]
             self.counts.setdefault(ctype, 0)
